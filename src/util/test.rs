@@ -9,9 +9,10 @@ use datafusion::{
     physical_plan::{
         common,
         stream::{RecordBatchReceiverStream, RecordBatchStreamAdapter},
-        DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, Partitioning, PlanProperties,
+        DisplayAs, DisplayFormatType, ExecutionPlan, Partitioning, PlanProperties,
     },
 };
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 
 /// A Mock ExecutionPlan that can be used for writing tests of other
 /// ExecutionPlans
@@ -59,7 +60,8 @@ impl MockExec {
         PlanProperties::new(
             eq_properties,
             Partitioning::UnknownPartitioning(1),
-            ExecutionMode::Bounded,
+            EmissionType::Both,
+            Boundedness::Bounded,
         )
     }
 }

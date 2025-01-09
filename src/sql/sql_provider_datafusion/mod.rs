@@ -32,11 +32,12 @@ use datafusion::{
     },
     physical_expr::EquivalenceProperties,
     physical_plan::{
-        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType, ExecutionMode,
+        stream::RecordBatchStreamAdapter, DisplayAs, DisplayFormatType,
         ExecutionPlan, Partitioning, PlanProperties, SendableRecordBatchStream,
     },
     sql::{unparser::Unparser, TableReference},
 };
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 
 #[cfg(feature = "federation")]
 pub mod federation;
@@ -295,7 +296,8 @@ impl<T, P> SqlExec<T, P> {
             properties: PlanProperties::new(
                 EquivalenceProperties::new(projected_schema),
                 Partitioning::UnknownPartitioning(1),
-                ExecutionMode::Bounded,
+                EmissionType::Both,
+                Boundedness::Bounded,
             ),
         })
     }

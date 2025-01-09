@@ -38,8 +38,9 @@ use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::stream::RecordBatchStreamAdapter;
 use datafusion::physical_plan::{
-    DisplayAs, DisplayFormatType, ExecutionMode, ExecutionPlan, PlanProperties,
+    DisplayAs, DisplayFormatType, ExecutionPlan, PlanProperties,
 };
+use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
 use futures::{StreamExt, TryStreamExt};
 use serde::{Deserialize, Serialize};
 use tonic::metadata::{AsciiMetadataKey, MetadataMap};
@@ -84,13 +85,14 @@ impl FlightExec {
 impl From<FlightConfig> for FlightExec {
     fn from(config: FlightConfig) -> Self {
         let exec_mode = if config.properties.unbounded_streams {
-            ExecutionMode::Unbounded
+            Boundedness::Unbounded { requires_infinite_memory: false }
         } else {
-            ExecutionMode::Bounded
+            Boundedness::Bounded
         };
         let plan_properties = PlanProperties::new(
             EquivalenceProperties::new(config.schema.clone()),
             Partitioning::UnknownPartitioning(config.partitions.len()),
+            EmissionType::Both,
             exec_mode,
         );
         let mut mm = MetadataMap::new();
