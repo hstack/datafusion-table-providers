@@ -8,10 +8,12 @@ license = "Apache-2.0"
 description = "Extend the capabilities of DataFusion to support additional data sources via implementations of the `TableProvider` trait."
 
 [dependencies]
-arrow-flight = { version = "53", optional = true, features = [
+arrow-flight = { version = "54.2.1", optional = true, features = [
   "flight-sql-experimental",
   "tls",
 ] }
+## explicitly listed only for enabling serde
+arrow-schema = { version = "54.2.1", optional = true, features = ["serde"] }
 arrow-odbc = { version = "=14.0.1", optional = true }
 async-stream = { version = "0.3", optional = true }
 async-trait = "0.1"
@@ -21,11 +23,11 @@ bigdecimal = "0.4"
 byteorder = "1.5.0"
 chrono = "0.4"
 dashmap = "6.1.0"
-datafusion = { version = "44", default-features = false }
+datafusion = { version = "46", default-features = false }
 datafusion-federation = { version = "=0.3.4", features = [
   "sql",
 ], optional = true }
-datafusion-proto = { version = "44", optional = true }
+datafusion-proto = { version = "46", optional = true }
 duckdb = { version = "1.1.1", features = [
   "bundled",
   "r2d2",
@@ -110,6 +112,7 @@ duckdb-federation = ["duckdb", "federation"]
 federation = ["dep:datafusion-federation"]
 flight = [
   "dep:arrow-flight",
+  "dep:arrow-schema",
   "datafusion/serde",
   "dep:datafusion-proto",
   "dep:serde",
