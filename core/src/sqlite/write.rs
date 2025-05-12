@@ -10,11 +10,11 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{
-        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
 };
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 use futures::StreamExt;
 use snafu::prelude::*;
 

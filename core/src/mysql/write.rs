@@ -10,7 +10,6 @@ use datafusion::{
     execution::{SendableRecordBatchStream, TaskContext},
     logical_expr::{dml::InsertOp, Expr},
     physical_plan::{
-        insert::{DataSink, DataSinkExec},
         metrics::MetricsSet,
         DisplayAs, DisplayFormatType, ExecutionPlan,
     },
@@ -21,6 +20,7 @@ use snafu::ResultExt;
 use std::any::Any;
 use std::fmt;
 use std::sync::Arc;
+use datafusion::datasource::sink::{DataSink, DataSinkExec};
 
 #[derive(Debug, Clone)]
 pub struct MySQLTableWriter {

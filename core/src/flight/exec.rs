@@ -274,7 +274,7 @@ impl DisplayAs for FlightExec {
                 self.config.origin,
                 self.config.partitions.len()
             ),
-            DisplayFormatType::Verbose => write!(
+            DisplayFormatType::Verbose | DisplayFormatType::TreeRender => write!(
                 f,
                 "FlightExec: origin={}, partitions={:?}, properties={:?}",
                 self.config.origin, self.config.partitions, self.config.properties,

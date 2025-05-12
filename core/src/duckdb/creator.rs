@@ -737,8 +737,9 @@ pub(crate) mod tests {
         execution::{SendableRecordBatchStream, TaskContext},
         logical_expr::dml::InsertOp,
         parquet::arrow::arrow_reader::ParquetRecordBatchReaderBuilder,
-        physical_plan::{insert::DataSink, memory::MemoryStream},
+        physical_plan::memory::MemoryStream,
     };
+    use datafusion::datasource::sink::DataSink;
     use tracing::subscriber::DefaultGuard;
     use tracing_subscriber::EnvFilter;
 
