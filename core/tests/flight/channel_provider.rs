@@ -1,11 +1,6 @@
-use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use arrow_flight::sql::{ProstMessageExt, TicketStatementQuery};
-use arrow_flight::{FlightEndpoint, FlightInfo, Location, Ticket};
 use async_trait::async_trait;
-use datafusion::arrow::array::{Int64Array, RecordBatch};
-use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::collect;
@@ -14,16 +9,13 @@ use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{FlightChannelProvider, FlightTableFactory};
-use prost::Message;
 use rstest::rstest;
-use tokio::sync::oneshot::{channel, Sender};
 use tonic::transport::Channel;
 
-use super::TestFlightSqlService;
+use super::{batch, options, start_service, test_service};
 
 const ORIGIN: &str = "http://origin.invalid";
 const DATA_LOCATION: &str = "http://data.invalid";
-const QUERY: &str = "SELECT id FROM test";
 
 #[derive(Debug, Default)]
 struct TestChannelProvider {
@@ -56,48 +48,6 @@ impl FlightChannelProvider for TestChannelProvider {
     }
 }
 
-fn batch(value: i64) -> RecordBatch {
-    RecordBatch::try_new(
-        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
-        vec![Arc::new(Int64Array::from(vec![value]))],
-    )
-    .unwrap()
-}
-
-async fn start_service(value: i64, locations: Vec<Vec<&str>>) -> (String, Sender<()>) {
-    let partition_data = batch(value);
-    let mut flight_info = FlightInfo::new()
-        .try_with_schema(partition_data.schema().as_ref())
-        .unwrap();
-    let ticket = Ticket::new(TicketStatementQuery::default().as_any().encode_to_vec());
-    for locations in locations {
-        let mut endpoint = FlightEndpoint::new().with_ticket(ticket.clone());
-        endpoint.location = locations
-            .into_iter()
-            .map(|uri| Location { uri: uri.into() })
-            .collect();
-        flight_info = flight_info.with_endpoint(endpoint);
-    }
-    let (tx, rx) = channel();
-    let service = TestFlightSqlService {
-        flight_info,
-        partition_data,
-        expected_handshake_headers: HashMap::new(),
-        expected_flight_info_query: QUERY.into(),
-        shutdown_sender: None,
-    };
-    let address = service.run_in_background(rx).await;
-    (format!("http://{address}"), tx)
-}
-
-fn options() -> HashMap<String, String> {
-    HashMap::from([
-        ("flight.sql.query".into(), QUERY.into()),
-        ("flight.sql.username".into(), "admin".into()),
-        ("flight.sql.password".into(), "password".into()),
-    ])
-}
-
 #[rstest]
 #[case::origin(vec![vec![]], vec![ORIGIN])]
 #[case::reuse(vec![vec!["arrow-flight-reuse-connection://?"]], vec![ORIGIN])]
@@ -108,7 +58,7 @@ async fn test_channel_provider_for_metadata_and_execution(
     #[case] locations: Vec<Vec<&str>>,
     #[case] execution_locations: Vec<&str>,
 ) {
-    let (endpoint, _shutdown) = start_service(7, locations).await;
+    let (endpoint, _shutdown) = start_service(test_service(batch(7), locations)).await;
     let provider = TestChannelProvider::connect(&endpoint).await;
     let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
         .with_channel_provider(provider.clone());
@@ -131,8 +81,10 @@ async fn test_channel_provider_for_metadata_and_execution(
 
 #[test_log::test(tokio::test)]
 async fn test_codec_uses_worker_provider_without_changing_serialized_plan() {
-    let (planner_endpoint, _planner_shutdown) = start_service(7, vec![vec![]]).await;
-    let (worker_endpoint, _worker_shutdown) = start_service(9, vec![vec![]]).await;
+    let (planner_endpoint, _planner_shutdown) =
+        start_service(test_service(batch(7), vec![vec![]])).await;
+    let (worker_endpoint, _worker_shutdown) =
+        start_service(test_service(batch(9), vec![vec![]])).await;
     let planner = TestChannelProvider::connect(&planner_endpoint).await;
     let worker = TestChannelProvider::connect(&worker_endpoint).await;
     let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
@@ -191,7 +143,7 @@ async fn test_channel_acquisition_errors_propagate() {
     assert!(matches!(error, DataFusionError::Execution(message)
         if message == "channel acquisition failed"));
 
-    let (endpoint, _shutdown) = start_service(7, vec![vec![]]).await;
+    let (endpoint, _shutdown) = start_service(test_service(batch(7), vec![vec![]])).await;
     let provider = TestChannelProvider::connect(&endpoint).await;
     let factory = FlightTableFactory::new(driver).with_channel_provider(provider);
     let table = factory.open_table(ORIGIN, options()).await.unwrap();

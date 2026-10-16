@@ -25,6 +25,7 @@ use std::sync::Arc;
 
 use crate::exec::FlightExec;
 use arrow_flight::error::FlightError;
+use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::FlightInfo;
 use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
@@ -195,7 +196,7 @@ pub trait FlightDriver: Sync + Send + Debug {
 pub struct FlightMetadata {
     /// FlightInfo object produced by the driver
     info: FlightInfo,
-    /// Various knobs that control execution
+    /// Various knobs that control Flight RPCs and execution
     props: FlightProperties,
     /// Arrow schema. Can be enforced by the driver or inferred from the FlightInfo
     schema: SchemaRef,
@@ -370,6 +371,15 @@ impl TableProvider for FlightTable {
 
 fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))
+}
+
+fn flight_service_client(
+    channel: Channel,
+    size_limits: &SizeLimits,
+) -> FlightServiceClient<Channel> {
+    FlightServiceClient::new(channel)
+        .max_encoding_message_size(size_limits.encoding)
+        .max_decoding_message_size(size_limits.decoding)
 }
 
 fn precision(total: i64) -> Precision<usize> {

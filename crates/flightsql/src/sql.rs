@@ -24,7 +24,7 @@ use arrow_flight::sql::client::FlightSqlServiceClient;
 use async_trait::async_trait;
 use tonic::transport::Channel;
 
-use crate::{FlightDriver, FlightMetadata, FlightProperties};
+use crate::{flight_service_client, FlightDriver, FlightMetadata, FlightProperties};
 
 pub const QUERY: &str = "flight.sql.query";
 pub const USERNAME: &str = "flight.sql.username";
@@ -54,6 +54,8 @@ impl FlightSqlDriver {
     /// The headers (if any) will only be used for the Handshake/GetFlightInfo calls by default.
     /// This behaviour can be changed by calling [Self::with_persistent_headers] below.
     /// Headers provided as options for the metadata call will overwrite the template ones.
+    /// Size limits apply to Handshake, GetFlightInfo and subsequent DoGet calls.
+    /// By default, all these calls have unlimited encoding and decoding sizes.
     pub fn with_properties_template(mut self, properties_template: FlightProperties) -> Self {
         self.properties_template = properties_template;
         self
@@ -73,7 +75,8 @@ impl FlightDriver for FlightSqlDriver {
         channel: Channel,
         options: &HashMap<String, String>,
     ) -> Result<FlightMetadata> {
-        let mut client = FlightSqlServiceClient::new(channel);
+        let inner_client = flight_service_client(channel, &self.properties_template.size_limits);
+        let mut client = FlightSqlServiceClient::new_from_inner(inner_client);
         let mut handshake_headers = self.properties_template.grpc_headers.clone();
         let headers_overlay = options.iter().filter_map(|(key, value)| {
             key.strip_prefix(HEADER_PREFIX)

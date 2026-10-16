@@ -22,9 +22,11 @@ use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::{to_df_err, FlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
+use crate::{
+    flight_service_client, to_df_err, FlightChannelProvider, FlightMetadata, FlightProperties,
+    SizeLimits,
+};
 use arrow_flight::error::FlightError;
-use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightClient, FlightEndpoint, Ticket};
 use datafusion::arrow::array::{new_null_array, ArrayRef, RecordBatch};
 use datafusion::arrow::compute::cast;
@@ -179,9 +181,7 @@ async fn flight_client(
     channel_provider: &dyn FlightChannelProvider,
 ) -> Result<FlightClient> {
     let channel = channel_provider.channel(source).await?;
-    let inner_client = FlightServiceClient::new(channel)
-        .max_encoding_message_size(size_limits.encoding)
-        .max_decoding_message_size(size_limits.decoding);
+    let inner_client = flight_service_client(channel, size_limits);
     let mut client = FlightClient::new_from_inner(inner_client);
     client.metadata_mut().clone_from(grpc_headers);
     Ok(client)

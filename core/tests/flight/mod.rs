@@ -9,7 +9,8 @@ use arrow_flight::flight_service_server::{FlightService, FlightServiceServer};
 use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
 use arrow_flight::{
-    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Ticket,
+    FlightDescriptor, FlightEndpoint, FlightInfo, HandshakeRequest, HandshakeResponse, Location,
+    Ticket,
 };
 use async_trait::async_trait;
 use datafusion::arrow::array::{Array, Float32Array, Int64Array, Int8Array, RecordBatch};
@@ -31,6 +32,9 @@ use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{FlightProperties, FlightTableFactory};
 
 mod channel_provider;
+mod size_limits;
+
+const QUERY: &str = "SELECT id FROM test";
 
 const AUTH_HEADER: &str = "authorization";
 const BEARER_TOKEN: &str = "Bearer flight-sql-token";
@@ -70,6 +74,50 @@ impl Drop for TestFlightSqlService {
             tx.send(()).ok();
         }
     }
+}
+
+fn batch(value: i64) -> RecordBatch {
+    RecordBatch::try_new(
+        Arc::new(Schema::new(vec![Field::new("id", DataType::Int64, false)])),
+        vec![Arc::new(Int64Array::from(vec![value]))],
+    )
+    .unwrap()
+}
+
+fn test_service(partition_data: RecordBatch, locations: Vec<Vec<&str>>) -> TestFlightSqlService {
+    let mut flight_info = FlightInfo::new()
+        .try_with_schema(partition_data.schema().as_ref())
+        .unwrap();
+    let ticket = Ticket::new(TicketStatementQuery::default().as_any().encode_to_vec());
+    for locations in locations {
+        let mut endpoint = FlightEndpoint::new().with_ticket(ticket.clone());
+        endpoint.location = locations
+            .into_iter()
+            .map(|uri| Location { uri: uri.into() })
+            .collect();
+        flight_info = flight_info.with_endpoint(endpoint);
+    }
+    TestFlightSqlService {
+        flight_info,
+        partition_data,
+        expected_handshake_headers: HashMap::new(),
+        expected_flight_info_query: QUERY.into(),
+        shutdown_sender: None,
+    }
+}
+
+async fn start_service(service: TestFlightSqlService) -> (String, Sender<()>) {
+    let (tx, rx) = channel();
+    let address = service.run_in_background(rx).await;
+    (format!("http://{address}"), tx)
+}
+
+fn options() -> HashMap<String, String> {
+    HashMap::from([
+        ("flight.sql.query".into(), QUERY.into()),
+        ("flight.sql.username".into(), "admin".into()),
+        ("flight.sql.password".into(), "password".into()),
+    ])
 }
 
 fn check_header<T>(request: &Request<T>, rpc: &str, header_name: &str, expected_value: &str) {
