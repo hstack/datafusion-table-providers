@@ -35,12 +35,14 @@ use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{CreateExternalTable, Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
-use tonic::transport::{Channel, ClientTlsConfig};
+use tonic::transport::Channel;
 
+mod channel;
 pub mod codec;
 mod exec;
 pub mod sql;
 
+pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::enforce_schema;
 
 /// Generic Arrow Flight data source. Requires a [FlightDriver] that allows implementors
@@ -50,7 +52,7 @@ pub use exec::enforce_schema;
 /// ```
 /// # use arrow_flight::{FlightClient, FlightDescriptor};
 /// # use datafusion::prelude::SessionContext;
-/// # use datafusion_table_providers::flight::{FlightDriver, FlightMetadata, FlightTableFactory};
+/// # use datafusion_table_providers_flightsql::{FlightDriver, FlightMetadata, FlightTableFactory};
 /// # use std::collections::HashMap;
 /// # use std::sync::Arc;
 /// # use tonic::transport::Channel;
@@ -94,12 +96,30 @@ pub use exec::enforce_schema;
 #[derive(Clone, Debug)]
 pub struct FlightTableFactory {
     driver: Arc<dyn FlightDriver>,
+    channel_provider: Arc<dyn FlightChannelProvider>,
 }
 
 impl FlightTableFactory {
     /// Create a data source using the provided driver
     pub fn new(driver: Arc<dyn FlightDriver>) -> Self {
-        Self { driver }
+        Self {
+            driver,
+            channel_provider: Arc::new(DefaultFlightChannelProvider),
+        }
+    }
+
+    /// Supply channels for metadata and execution RPCs.
+    ///
+    /// Metadata refreshes retain the channel acquired when the table is opened.
+    /// Execution acquires a channel for each selected flight endpoint location.
+    /// If you decide to supply a custom channel provider, you likely also need
+    /// to configure the codec with [`codec::FlightPhysicalCodec::with_channel_provider`].
+    pub fn with_channel_provider(
+        mut self,
+        channel_provider: Arc<dyn FlightChannelProvider>,
+    ) -> Self {
+        self.channel_provider = channel_provider;
+        self
     }
 
     /// Convenient way to create a [FlightTable] programatically, as an alternative to DDL.
@@ -109,7 +129,7 @@ impl FlightTableFactory {
         options: HashMap<String, String>,
     ) -> datafusion::common::Result<FlightTable> {
         let origin = entry_point.into();
-        let channel = flight_channel(&origin).await?;
+        let channel = self.channel_provider.channel(&origin).await?;
         let metadata = self
             .driver
             .metadata(channel.clone(), &options)
@@ -137,6 +157,7 @@ impl FlightTableFactory {
             origin,
             logical_schema,
             stats,
+            channel_provider: self.channel_provider.clone(),
         })
     }
 }
@@ -303,6 +324,7 @@ pub struct FlightTable {
     origin: String,
     logical_schema: SchemaRef,
     stats: Statistics,
+    channel_provider: Arc<dyn FlightChannelProvider>,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -337,6 +359,7 @@ impl TableProvider for FlightTable {
             metadata.as_ref(),
             projection,
             &self.origin,
+            self.channel_provider.clone(),
         )?))
     }
 
@@ -347,17 +370,6 @@ impl TableProvider for FlightTable {
 
 fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))
-}
-
-async fn flight_channel(source: impl Into<String>) -> datafusion::common::Result<Channel> {
-    let tls_config = ClientTlsConfig::new().with_enabled_roots();
-    Channel::from_shared(source.into())
-        .map_err(to_df_err)?
-        .tls_config(tls_config)
-        .map_err(to_df_err)?
-        .connect()
-        .await
-        .map_err(to_df_err)
 }
 
 fn precision(total: i64) -> Precision<usize> {

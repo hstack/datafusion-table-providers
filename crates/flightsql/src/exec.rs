@@ -22,7 +22,7 @@ use std::fmt::{Debug, Formatter};
 use std::str::FromStr;
 use std::sync::Arc;
 
-use crate::{flight_channel, to_df_err, FlightMetadata, FlightProperties, SizeLimits};
+use crate::{to_df_err, FlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::{FlightClient, FlightEndpoint, Ticket};
@@ -47,6 +47,7 @@ use tonic::metadata::{AsciiMetadataKey, MetadataMap};
 #[derive(Clone, Debug)]
 pub(crate) struct FlightExec {
     config: FlightConfig,
+    channel_provider: Arc<dyn FlightChannelProvider>,
     plan_properties: Arc<PlanProperties>,
     metadata_map: Arc<MetadataMap>,
 }
@@ -54,10 +55,11 @@ pub(crate) struct FlightExec {
 impl FlightExec {
     /// Creates a FlightExec with the provided [FlightMetadata]
     /// and origin URL (used as fallback location as per the protocol spec).
-    pub fn try_new(
+    pub(crate) fn try_new(
         metadata: &FlightMetadata,
         projection: Option<&Vec<usize>>,
         origin: &str,
+        channel_provider: Arc<dyn FlightChannelProvider>,
     ) -> Result<Self> {
         let partitions = metadata
             .info
@@ -72,16 +74,17 @@ impl FlightExec {
             partitions,
             properties: metadata.props.clone(),
         };
-        Ok(config.into())
+        Ok(Self::from_config(config, channel_provider))
     }
 
     pub(crate) fn config(&self) -> &FlightConfig {
         &self.config
     }
-}
 
-impl From<FlightConfig> for FlightExec {
-    fn from(config: FlightConfig) -> Self {
+    pub(crate) fn from_config(
+        config: FlightConfig,
+        channel_provider: Arc<dyn FlightChannelProvider>,
+    ) -> Self {
         let exec_mode = if config.properties.unbounded_streams {
             Boundedness::Unbounded {
                 requires_infinite_memory: false,
@@ -103,6 +106,7 @@ impl From<FlightConfig> for FlightExec {
         }
         Self {
             config,
+            channel_provider,
             plan_properties,
             metadata_map: Arc::from(mm),
         }
@@ -169,11 +173,12 @@ impl FlightPartition {
 }
 
 async fn flight_client(
-    source: impl Into<String>,
+    source: &str,
     grpc_headers: &MetadataMap,
     size_limits: &SizeLimits,
+    channel_provider: &dyn FlightChannelProvider,
 ) -> Result<FlightClient> {
-    let channel = flight_channel(source).await?;
+    let channel = channel_provider.channel(source).await?;
     let inner_client = FlightServiceClient::new(channel)
         .max_encoding_message_size(size_limits.encoding)
         .max_decoding_message_size(size_limits.decoding);
@@ -187,10 +192,19 @@ async fn flight_stream(
     schema: SchemaRef,
     grpc_headers: Arc<MetadataMap>,
     size_limits: SizeLimits,
+    channel_provider: Arc<dyn FlightChannelProvider>,
 ) -> Result<SendableRecordBatchStream> {
     let mut errors: Vec<Box<dyn Error + Send + Sync>> = vec![];
     for loc in partition.locations.iter() {
-        let get_client = || async { flight_client(loc, grpc_headers.as_ref(), &size_limits).await };
+        let get_client = || async {
+            flight_client(
+                loc,
+                grpc_headers.as_ref(),
+                &size_limits,
+                channel_provider.as_ref(),
+            )
+            .await
+        };
         let client = run_async_with_tokio(get_client).await?;
         match try_fetch_stream(client, &partition.ticket, schema.clone()).await {
             Ok(stream) => return Ok(stream),
@@ -312,6 +326,7 @@ impl ExecutionPlan for FlightExec {
             self.schema(),
             self.metadata_map.clone(),
             self.config.properties.size_limits,
+            self.channel_provider.clone(),
         );
         let stream = futures::stream::once(future_stream).try_flatten();
         Ok(Box::pin(RecordBatchStreamAdapter::new(

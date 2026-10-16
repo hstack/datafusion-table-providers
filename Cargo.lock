@@ -2447,6 +2447,7 @@ dependencies = [
  "clickhouse",
  "datafusion",
  "datafusion-federation",
+ "datafusion-proto",
  "datafusion-table-providers-adbc",
  "datafusion-table-providers-clickhouse",
  "datafusion-table-providers-common",

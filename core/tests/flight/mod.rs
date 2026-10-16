@@ -30,6 +30,8 @@ use tonic::{Extensions, Request, Response, Status, Streaming};
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
 use datafusion_table_providers::flight::{FlightProperties, FlightTableFactory};
 
+mod channel_provider;
+
 const AUTH_HEADER: &str = "authorization";
 const BEARER_TOKEN: &str = "Bearer flight-sql-token";
 

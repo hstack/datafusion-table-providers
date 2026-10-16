@@ -20,15 +20,39 @@
 use std::sync::Arc;
 
 use crate::exec::{FlightConfig, FlightExec};
-use crate::to_df_err;
+use crate::{to_df_err, DefaultFlightChannelProvider, FlightChannelProvider};
 use datafusion::common::DataFusionError;
 use datafusion::execution::TaskContext;
 use datafusion::physical_plan::ExecutionPlan;
 use datafusion_proto::physical_plan::PhysicalExtensionCodec;
 
 /// Physical extension codec for FlightExec
-#[derive(Clone, Debug, Default)]
-pub struct FlightPhysicalCodec {}
+#[derive(Clone, Debug)]
+pub struct FlightPhysicalCodec {
+    channel_provider: Arc<dyn FlightChannelProvider>,
+}
+
+impl Default for FlightPhysicalCodec {
+    fn default() -> Self {
+        Self {
+            channel_provider: Arc::new(DefaultFlightChannelProvider),
+        }
+    }
+}
+
+impl FlightPhysicalCodec {
+    /// Supply channels for decoded execution plans.
+    ///
+    /// Configure each worker's codec with its local provider. The provider is
+    /// runtime-only state and does not change the serialized plan format.
+    pub fn with_channel_provider(
+        mut self,
+        channel_provider: Arc<dyn FlightChannelProvider>,
+    ) -> Self {
+        self.channel_provider = channel_provider;
+        self
+    }
+}
 
 impl PhysicalExtensionCodec for FlightPhysicalCodec {
     fn try_decode(
@@ -39,7 +63,10 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         if inputs.is_empty() {
             let config: FlightConfig = serde_json::from_slice(buf).map_err(to_df_err)?;
-            Ok(Arc::from(FlightExec::from(config)))
+            Ok(Arc::new(FlightExec::from_config(
+                config,
+                self.channel_provider.clone(),
+            )))
         } else {
             Err(DataFusionError::Internal(
                 "FlightExec is not supposed to have any inputs".into(),

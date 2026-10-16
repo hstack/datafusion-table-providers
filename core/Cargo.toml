@@ -36,6 +36,7 @@ chrono = "0.4.44"
 clickhouse = "0.15"
 datafusion = { workspace = true, default-features = false, features = ["sql"] }
 datafusion-federation = { workspace = true, features = ["sql"] }
+datafusion-proto = { workspace = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
