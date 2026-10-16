@@ -2608,6 +2608,7 @@ dependencies = [
  "datafusion-proto",
  "datafusion-table-providers-common",
  "futures",
+ "moka",
  "prost",
  "serde",
  "serde_json",
