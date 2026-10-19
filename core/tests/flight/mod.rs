@@ -29,10 +29,13 @@ use tonic::transport::Server;
 use tonic::{Extensions, Request, Response, Status, Streaming};
 
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
-use datafusion_table_providers::flight::{FlightProperties, FlightTableFactory};
+use datafusion_table_providers::flight::{
+    FlightFactoryOptions, FlightProperties, FlightTableFactory,
+};
 
 mod channel_provider;
 mod size_limits;
+mod timeouts;
 
 const QUERY: &str = "SELECT id FROM test";
 
@@ -45,6 +48,7 @@ struct TestFlightSqlService {
     expected_handshake_headers: HashMap<String, String>,
     expected_flight_info_query: String,
     shutdown_sender: Option<Sender<()>>,
+    handshake_error: Option<Status>,
 }
 
 impl TestFlightSqlService {
@@ -103,6 +107,7 @@ fn test_service(partition_data: RecordBatch, locations: Vec<Vec<&str>>) -> TestF
         expected_handshake_headers: HashMap::new(),
         expected_flight_info_query: QUERY.into(),
         shutdown_sender: None,
+        handshake_error: None,
     }
 }
 
@@ -150,6 +155,9 @@ impl FlightSqlService for TestFlightSqlService {
         Response<Pin<Box<dyn Stream<Item = Result<HandshakeResponse, Status>> + Send>>>,
         Status,
     > {
+        if let Some(error) = &self.handshake_error {
+            return Err(error.clone());
+        }
         for (header_name, expected_value) in self.expected_handshake_headers.iter() {
             check_header(&request, "do_handshake", header_name, expected_value);
         }
@@ -238,15 +246,22 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
         ]),
         expected_flight_info_query: query.into(),
         shutdown_sender: Some(tx),
+        handshake_error: None,
     };
     let port = service.run_in_background(rx).await.port();
     let ctx = SessionContext::new();
-    let props_template = FlightProperties::new().with_reusable_flight_info(true);
-    let driver = FlightSqlDriver::new().with_properties_template(props_template);
-    ctx.state_ref().write().table_factories_mut().insert(
-        "FLIGHT_SQL".into(),
-        Arc::new(FlightTableFactory::new(Arc::new(driver))),
-    );
+    let properties = FlightProperties::new()
+        .with_reusable_flight_info(true)
+        .with_grpc_headers(HashMap::from([
+            ("custom-hdr1".into(), "default".into()),
+            ("custom-hdr2".into(), "v2".into()),
+        ]));
+    let factory = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_properties(properties));
+    ctx.state_ref()
+        .write()
+        .table_factories_mut()
+        .insert("FLIGHT_SQL".into(), Arc::new(factory));
     let _ = ctx
         .sql(&format!(
             r#"
@@ -257,7 +272,6 @@ async fn test_flight_sql_data_source() -> datafusion::common::Result<()> {
             'flight.sql.password' 'password',
             'flight.sql.query' '{query}',
             'flight.sql.header.custom-hdr1' 'v1',
-            'flight.sql.header.custom-hdr2' 'v2',
         )"#
         ))
         .await

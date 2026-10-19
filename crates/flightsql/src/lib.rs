@@ -21,7 +21,9 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
+use std::future::Future;
 use std::sync::Arc;
+use std::time::Duration;
 
 use crate::exec::FlightExec;
 use arrow_flight::error::FlightError;
@@ -52,10 +54,12 @@ pub use exec::enforce_schema;
 /// # Sample usage:
 /// ```
 /// # use arrow_flight::{FlightClient, FlightDescriptor};
+/// # use arrow_flight::flight_service_client::FlightServiceClient;
 /// # use datafusion::prelude::SessionContext;
-/// # use datafusion_table_providers_flightsql::{FlightDriver, FlightMetadata, FlightTableFactory};
+/// # use datafusion_table_providers_flightsql::{FlightDriver, FlightFactoryOptions, FlightMetadata, FlightProperties, FlightTableFactory};
 /// # use std::collections::HashMap;
 /// # use std::sync::Arc;
+/// # use std::time::Duration;
 /// # use tonic::transport::Channel;
 ///
 /// #[derive(Debug, Clone, Default)]
@@ -65,25 +69,28 @@ pub use exec::enforce_schema;
 /// impl FlightDriver for CustomFlightDriver {
 ///     async fn metadata(
 ///         &self,
-///         channel: Channel,
+///         client: FlightServiceClient<Channel>,
+///         properties: FlightProperties,
 ///         opts: &HashMap<String, String>,
 ///     ) -> arrow_flight::error::Result<FlightMetadata> {
-///         let mut client = FlightClient::new(channel);
+///         let mut client = FlightClient::new_from_inner(client);
 ///         // for simplicity, we'll just assume the server expects a string command and no handshake
 ///         let descriptor = FlightDescriptor::new_cmd(opts["flight.command"].clone());
 ///         let flight_info = client.get_flight_info(descriptor).await?;
-///         FlightMetadata::try_from(flight_info)
+///         FlightMetadata::try_new(flight_info, properties)
 ///     }
 /// }
 ///
 /// #[tokio::main]
 /// async fn main() {
 ///     let ctx = SessionContext::new();
+///     let factory = FlightTableFactory::new(Arc::new(CustomFlightDriver::default()))
+///         .with_options(
+///             FlightFactoryOptions::new().with_metadata_timeout(Duration::from_secs(30)),
+///         );
 ///     ctx.state_ref().write().table_factories_mut().insert(
 ///         "CUSTOM_FLIGHT".into(),
-///         Arc::new(FlightTableFactory::new(Arc::new(
-///             CustomFlightDriver::default(),
-///         ))),
+///         Arc::new(factory),
 ///     );
 ///     let _ = ctx.sql(
 ///         r#"
@@ -98,6 +105,7 @@ pub use exec::enforce_schema;
 pub struct FlightTableFactory {
     driver: Arc<dyn FlightDriver>,
     channel_provider: Arc<dyn FlightChannelProvider>,
+    options: FlightFactoryOptions,
 }
 
 impl FlightTableFactory {
@@ -106,13 +114,17 @@ impl FlightTableFactory {
         Self {
             driver,
             channel_provider: Arc::new(DefaultFlightChannelProvider),
+            options: FlightFactoryOptions::default(),
         }
     }
 
+    /// Configure request policy and the default properties passed to the driver.
+    pub fn with_options(mut self, options: FlightFactoryOptions) -> Self {
+        self.options = options;
+        self
+    }
+
     /// Supply channels for metadata and execution RPCs.
-    ///
-    /// Metadata refreshes retain the channel acquired when the table is opened.
-    /// Execution acquires a channel for each selected flight endpoint location.
     /// If you decide to supply a custom channel provider, you likely also need
     /// to configure the codec with [`codec::FlightPhysicalCodec::with_channel_provider`].
     pub fn with_channel_provider(
@@ -130,12 +142,19 @@ impl FlightTableFactory {
         options: HashMap<String, String>,
     ) -> datafusion::common::Result<FlightTable> {
         let origin = entry_point.into();
-        let channel = self.channel_provider.channel(&origin).await?;
-        let metadata = self
-            .driver
-            .metadata(channel.clone(), &options)
-            .await
-            .map_err(to_df_err)?;
+        let (client, metadata) =
+            with_metadata_timeout(&origin, self.options.metadata_timeout, async {
+                let channel = self.channel_provider.channel(&origin).await?;
+                let client = flight_service_client(channel, &self.options.size_limits);
+                let metadata = self
+                    .driver
+                    .metadata(client.clone(), self.options.properties.clone(), &options)
+                    .await
+                    .map_err(to_df_err)?;
+                Ok((client, metadata))
+            })
+            .await?;
+
         let num_rows = precision(metadata.info.total_records);
         let total_byte_size = precision(metadata.info.total_bytes);
         let logical_schema = metadata.schema.clone();
@@ -144,21 +163,25 @@ impl FlightTableFactory {
             total_byte_size,
             column_statistics: vec![],
         };
+
         let metadata_supplier = if metadata.props.reusable_flight_info {
             MetadataSupplier::Reusable(Arc::new(metadata))
         } else {
             MetadataSupplier::Refresh {
                 driver: self.driver.clone(),
-                channel,
+                client: Box::new(client),
                 options,
+                factory_options: self.options.clone(),
             }
         };
+
         Ok(FlightTable {
             metadata_supplier,
             origin,
             logical_schema,
             stats,
             channel_provider: self.channel_provider.clone(),
+            size_limits: self.options.size_limits,
         })
     }
 }
@@ -175,17 +198,68 @@ impl TableProviderFactory for FlightTableFactory {
     }
 }
 
+/// Caller-selected request policy and default table properties.
+///
+/// Configure these on [`FlightTableFactory::with_options`]. Drivers receive a
+/// client with the selected message limits and a copy of the property defaults.
+/// Only execution settings, not metadata deadlines, are serialized into plans.
+#[derive(Clone, Debug, Default)]
+pub struct FlightFactoryOptions {
+    size_limits: SizeLimits,
+    metadata_timeout: Option<Duration>,
+    properties: FlightProperties,
+}
+
+impl FlightFactoryOptions {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Max sizes in bytes for encoded/decoded gRPC messages.
+    ///
+    /// Applies to the metadata client supplied to the driver and to `DoGet`.
+    /// Both sizes are unlimited by default.
+    pub fn with_size_limits(mut self, size_limits: SizeLimits) -> Self {
+        self.size_limits = size_limits;
+        self
+    }
+
+    /// Limit the time spent acquiring metadata, including channel acquisition.
+    ///
+    /// A single budget covers the initial channel acquisition and all driver
+    /// metadata RPCs, including authentication. Each metadata refresh gets a
+    /// fresh budget on the retained channel. By default there is no timeout.
+    ///
+    /// This does not limit `DoGet` execution or close shared channels on expiry.
+    pub fn with_metadata_timeout(mut self, timeout: Duration) -> Self {
+        self.metadata_timeout = Some(timeout);
+        self
+    }
+
+    /// Default table properties supplied to the driver for each metadata call.
+    ///
+    /// The driver may refine these defaults based on the service's response.
+    /// Returned properties govern table scans and execution, not request policy.
+    pub fn with_properties(mut self, properties: FlightProperties) -> Self {
+        self.properties = properties;
+        self
+    }
+}
+
 /// Extension point for integrating any Flight RPC service as a [FlightTableFactory].
 /// Handles the initial `GetFlightInfo` call and all its prerequisites (such as `Handshake`),
 /// to produce a [FlightMetadata].
 #[async_trait]
 pub trait FlightDriver: Sync + Send + Debug {
-    /// Returns a [FlightMetadata] from the specified channel,
-    /// according to the provided table options.
+    /// Returns a [FlightMetadata] according to the provided table options.
+    ///
+    /// Use the supplied client when constructing an Arrow Flight client.
+    /// Preserve or refine the supplied default properties in the returned metadata.
     /// The driver must provide at least a [FlightInfo] in order to construct a flight metadata.
     async fn metadata(
         &self,
-        channel: Channel,
+        client: FlightServiceClient<Channel>,
+        properties: FlightProperties,
         options: &HashMap<String, String>,
     ) -> arrow_flight::error::Result<FlightMetadata>;
 }
@@ -196,7 +270,7 @@ pub trait FlightDriver: Sync + Send + Debug {
 pub struct FlightMetadata {
     /// FlightInfo object produced by the driver
     info: FlightInfo,
-    /// Various knobs that control Flight RPCs and execution
+    /// Driver-resolved table semantics and execution headers
     props: FlightProperties,
     /// Arrow schema. Can be enforced by the driver or inferred from the FlightInfo
     schema: SchemaRef,
@@ -227,13 +301,13 @@ impl TryFrom<FlightInfo> for FlightMetadata {
     }
 }
 
-/// Meant to gradually encapsulate all sorts of knobs required
-/// for controlling the protocol and query execution details.
+/// Table semantics and execution headers resolved by a [`FlightDriver`].
+///
+/// Also used as driver input defaults through [`FlightFactoryOptions::with_properties`].
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 pub struct FlightProperties {
     unbounded_streams: bool,
     grpc_headers: HashMap<String, String>,
-    size_limits: SizeLimits,
     reusable_flight_info: bool,
 }
 
@@ -248,16 +322,20 @@ impl FlightProperties {
         self
     }
 
+    /// Whether the service will produce infinite streams.
+    pub fn unbounded_streams(&self) -> bool {
+        self.unbounded_streams
+    }
+
     /// gRPC headers to use on subsequent calls.
     pub fn with_grpc_headers(mut self, grpc_headers: HashMap<String, String>) -> Self {
         self.grpc_headers = grpc_headers;
         self
     }
 
-    /// Max sizes in bytes for encoded/decoded gRPC messages.
-    pub fn with_size_limits(mut self, size_limits: SizeLimits) -> Self {
-        self.size_limits = size_limits;
-        self
+    /// gRPC headers to use on subsequent calls.
+    pub fn grpc_headers(&self) -> &HashMap<String, String> {
+        &self.grpc_headers
     }
 
     /// Whether the FlightInfo objects produced by the service can be used multiple times
@@ -265,6 +343,11 @@ impl FlightProperties {
     pub fn with_reusable_flight_info(mut self, reusable_flight_info: bool) -> Self {
         self.reusable_flight_info = reusable_flight_info;
         self
+    }
+
+    /// Whether the FlightInfo can be reused without refreshing it before a scan.
+    pub fn reusable_flight_info(&self) -> bool {
+        self.reusable_flight_info
     }
 }
 
@@ -296,25 +379,38 @@ enum MetadataSupplier {
     Reusable(Arc<FlightMetadata>),
     Refresh {
         driver: Arc<dyn FlightDriver>,
-        channel: Channel,
+        client: Box<FlightServiceClient<Channel>>,
         options: HashMap<String, String>,
+        factory_options: FlightFactoryOptions,
     },
 }
 
 impl MetadataSupplier {
-    async fn flight_metadata(&self) -> datafusion::common::Result<Arc<FlightMetadata>> {
+    async fn flight_metadata(
+        &self,
+        origin: &str,
+    ) -> datafusion::common::Result<Arc<FlightMetadata>> {
         match self {
             Self::Reusable(metadata) => Ok(metadata.clone()),
             Self::Refresh {
                 driver,
-                channel,
+                client,
                 options,
-            } => Ok(Arc::new(
-                driver
-                    .metadata(channel.clone(), options)
-                    .await
-                    .map_err(to_df_err)?,
-            )),
+                factory_options,
+            } => {
+                with_metadata_timeout(origin, factory_options.metadata_timeout, async {
+                    driver
+                        .metadata(
+                            client.as_ref().clone(),
+                            factory_options.properties.clone(),
+                            options,
+                        )
+                        .await
+                        .map(Arc::new)
+                        .map_err(to_df_err)
+                })
+                .await
+            }
         }
     }
 }
@@ -326,6 +422,7 @@ pub struct FlightTable {
     logical_schema: SchemaRef,
     stats: Statistics,
     channel_provider: Arc<dyn FlightChannelProvider>,
+    size_limits: SizeLimits,
 }
 
 impl std::fmt::Debug for FlightTable {
@@ -355,11 +452,12 @@ impl TableProvider for FlightTable {
         _filters: &[Expr],
         _limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
-        let metadata = self.metadata_supplier.flight_metadata().await?;
+        let metadata = self.metadata_supplier.flight_metadata(&self.origin).await?;
         Ok(Arc::new(FlightExec::try_new(
             metadata.as_ref(),
             projection,
             &self.origin,
+            self.size_limits,
             self.channel_provider.clone(),
         )?))
     }
@@ -371,6 +469,21 @@ impl TableProvider for FlightTable {
 
 fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))
+}
+
+async fn with_metadata_timeout<T>(
+    origin: &str,
+    timeout: Option<Duration>,
+    future: impl Future<Output = datafusion::common::Result<T>>,
+) -> datafusion::common::Result<T> {
+    match timeout {
+        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
+            DataFusionError::Execution(format!(
+                "Flight metadata operation for '{origin}' timed out after {timeout:?}"
+            ))
+        })?,
+        None => future.await,
+    }
 }
 
 fn flight_service_client(

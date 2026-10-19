@@ -7,8 +7,10 @@ use datafusion::arrow::array::{Int64Array, RecordBatch};
 use datafusion::catalog::TableProvider;
 use datafusion::physical_plan::collect;
 use datafusion::prelude::SessionContext;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
 use datafusion_table_providers::flight::sql::FlightSqlDriver;
-use datafusion_table_providers::flight::{FlightProperties, FlightTableFactory, SizeLimits};
+use datafusion_table_providers::flight::{FlightFactoryOptions, FlightTableFactory, SizeLimits};
 use futures::{stream, TryStreamExt};
 use prost::Message;
 use rstest::rstest;
@@ -42,10 +44,8 @@ async fn test_metadata_message_size_limits(#[case] encoding: bool, #[case] overf
     };
     let limit = size - overflow;
     let (endpoint, _shutdown) = start_service(service).await;
-    let driver = FlightSqlDriver::new().with_properties_template(
-        FlightProperties::new().with_size_limits(limits(encoding, limit)),
-    );
-    let result = FlightTableFactory::new(Arc::new(driver))
+    let result = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_size_limits(limits(encoding, limit)))
         .open_table(endpoint, options())
         .await;
     if overflow == 0 {
@@ -101,15 +101,19 @@ async fn test_do_get_message_size_limits(#[case] encoding: bool, #[case] overflo
     };
     let limit = size - overflow;
     let (endpoint, _shutdown) = start_service(service).await;
-    let driver = FlightSqlDriver::new().with_properties_template(
-        FlightProperties::new().with_size_limits(limits(encoding, limit)),
-    );
-    let table = FlightTableFactory::new(Arc::new(driver))
+    let table = FlightTableFactory::new(Arc::new(FlightSqlDriver::new()))
+        .with_options(FlightFactoryOptions::new().with_size_limits(limits(encoding, limit)))
         .open_table(endpoint, options())
         .await
         .unwrap();
     let ctx = SessionContext::new();
     let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+    let codec = FlightPhysicalCodec::default();
+    let mut bytes = vec![];
+    codec.try_encode(plan, &mut bytes).unwrap();
+    let plan = codec
+        .try_decode(&bytes, &[], ctx.task_ctx().as_ref())
+        .unwrap();
     let result = collect(plan, ctx.task_ctx()).await;
     if overflow == 0 {
         assert_eq!(result.unwrap(), vec![data]);

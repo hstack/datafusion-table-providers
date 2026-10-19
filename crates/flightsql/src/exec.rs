@@ -61,6 +61,7 @@ impl FlightExec {
         metadata: &FlightMetadata,
         projection: Option<&Vec<usize>>,
         origin: &str,
+        size_limits: SizeLimits,
         channel_provider: Arc<dyn FlightChannelProvider>,
     ) -> Result<Self> {
         let partitions = metadata
@@ -75,6 +76,7 @@ impl FlightExec {
             schema,
             partitions,
             properties: metadata.props.clone(),
+            size_limits,
         };
         Ok(Self::from_config(config, channel_provider))
     }
@@ -121,6 +123,7 @@ pub(crate) struct FlightConfig {
     schema: SchemaRef,
     partitions: Arc<[FlightPartition]>,
     properties: FlightProperties,
+    size_limits: SizeLimits,
 }
 
 /// The minimum information required for fetching a flight stream.
@@ -325,7 +328,7 @@ impl ExecutionPlan for FlightExec {
             self.config.partitions[partition].clone(),
             self.schema(),
             self.metadata_map.clone(),
-            self.config.properties.size_limits,
+            self.config.size_limits,
             self.channel_provider.clone(),
         );
         let stream = futures::stream::once(future_stream).try_flatten();
@@ -369,13 +372,13 @@ mod tests {
             .with_grpc_headers(HashMap::from([
                 ("h1".into(), "v1".into()),
                 ("h2".into(), "v2".into()),
-            ]))
-            .with_size_limits(SizeLimits::new(1024, 1024));
+            ]));
         let config = FlightConfig {
             origin: "http://localhost:50050".into(),
             schema,
             partitions,
             properties,
+            size_limits: SizeLimits::new(1024, 1024),
         };
         let json = serde_json::to_vec(&config).expect("cannot encode config as json");
         let restored = serde_json::from_slice(json.as_slice()).expect("cannot decode json config");
