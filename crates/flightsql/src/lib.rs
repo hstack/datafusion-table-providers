@@ -21,10 +21,10 @@
 use std::collections::HashMap;
 use std::error::Error;
 use std::fmt::Debug;
-use std::future::Future;
 use std::sync::Arc;
 use std::time::Duration;
 
+use crate::access::{connect_and_fetch_metadata, fetch_metadata};
 use crate::exec::FlightExec;
 use arrow_flight::error::FlightError;
 use arrow_flight::flight_service_client::FlightServiceClient;
@@ -40,6 +40,7 @@ use datafusion::physical_plan::ExecutionPlan;
 use serde::{Deserialize, Serialize};
 use tonic::transport::Channel;
 
+mod access;
 mod channel;
 pub mod codec;
 mod exec;
@@ -142,18 +143,14 @@ impl FlightTableFactory {
         options: HashMap<String, String>,
     ) -> datafusion::common::Result<FlightTable> {
         let origin = entry_point.into();
-        let (client, metadata) =
-            with_metadata_timeout(&origin, self.options.metadata_timeout, async {
-                let channel = self.channel_provider.channel(&origin).await?;
-                let client = flight_service_client(channel, &self.options.size_limits);
-                let metadata = self
-                    .driver
-                    .metadata(client.clone(), self.options.properties.clone(), &options)
-                    .await
-                    .map_err(to_df_err)?;
-                Ok((client, metadata))
-            })
-            .await?;
+        let (client, metadata) = connect_and_fetch_metadata(
+            &origin,
+            self.driver.as_ref(),
+            &self.options,
+            self.channel_provider.as_ref(),
+            &options,
+        )
+        .await?;
 
         let num_rows = precision(metadata.info.total_records);
         let total_byte_size = precision(metadata.info.total_bytes);
@@ -397,20 +394,15 @@ impl MetadataSupplier {
                 client,
                 options,
                 factory_options,
-            } => {
-                with_metadata_timeout(origin, factory_options.metadata_timeout, async {
-                    driver
-                        .metadata(
-                            client.as_ref().clone(),
-                            factory_options.properties.clone(),
-                            options,
-                        )
-                        .await
-                        .map(Arc::new)
-                        .map_err(to_df_err)
-                })
-                .await
-            }
+            } => fetch_metadata(
+                origin,
+                client.as_ref().clone(),
+                driver.as_ref(),
+                factory_options,
+                options,
+            )
+            .await
+            .map(Arc::new),
         }
     }
 }
@@ -469,21 +461,6 @@ impl TableProvider for FlightTable {
 
 fn to_df_err<E: Error + Send + Sync + 'static>(err: E) -> DataFusionError {
     DataFusionError::External(Box::new(err))
-}
-
-async fn with_metadata_timeout<T>(
-    origin: &str,
-    timeout: Option<Duration>,
-    future: impl Future<Output = datafusion::common::Result<T>>,
-) -> datafusion::common::Result<T> {
-    match timeout {
-        Some(timeout) => tokio::time::timeout(timeout, future).await.map_err(|_| {
-            DataFusionError::Execution(format!(
-                "Flight metadata operation for '{origin}' timed out after {timeout:?}"
-            ))
-        })?,
-        None => future.await,
-    }
 }
 
 fn flight_service_client(

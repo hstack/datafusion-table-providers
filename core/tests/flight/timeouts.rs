@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -6,15 +7,19 @@ use arrow_flight::flight_service_client::FlightServiceClient;
 use arrow_flight::FlightInfo;
 use async_trait::async_trait;
 use datafusion::catalog::TableProvider;
+use datafusion::common::stats::Precision;
 use datafusion::common::{DataFusionError, Result};
 use datafusion::physical_plan::execution_plan::Boundedness;
 use datafusion::prelude::SessionContext;
+use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+use datafusion_table_providers::flight::codec::FlightPhysicalCodec;
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, HEADER_PREFIX};
 use datafusion_table_providers::flight::{
     FlightChannelProvider, FlightDriver, FlightFactoryOptions, FlightMetadata, FlightProperties,
     FlightTableFactory,
 };
 use rstest::rstest;
+use tokio::sync::Notify;
 use tokio::time::{sleep, Instant};
 use tonic::transport::Channel;
 use tonic::Status;
@@ -145,6 +150,163 @@ async fn test_factory_property_defaults_are_used_for_reusable_metadata() {
         plan.properties().boundedness,
         Boundedness::Unbounded { .. }
     ));
+}
+
+#[derive(Debug)]
+struct MetadataOnlyDriver {
+    calls: AtomicUsize,
+    info: FlightInfo,
+}
+
+#[async_trait]
+impl FlightDriver for MetadataOnlyDriver {
+    async fn metadata(
+        &self,
+        _client: FlightServiceClient<Channel>,
+        properties: FlightProperties,
+        _options: &HashMap<String, String>,
+    ) -> arrow_flight::error::Result<FlightMetadata> {
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let info = self
+            .info
+            .clone()
+            .with_total_records(17 + call as i64)
+            .with_total_bytes(99 + call as i64);
+        FlightMetadata::try_new(info, properties)
+    }
+}
+
+#[rstest]
+#[case::refresh(false)]
+#[case::reuse(true)]
+#[tokio::test]
+async fn metadata_only_driver_reuses_only_explicit_metadata(#[case] reusable: bool) {
+    let driver = Arc::new(MetadataOnlyDriver {
+        calls: AtomicUsize::new(0),
+        info: test_service(batch(7), vec![vec![]]).flight_info.clone(),
+    });
+    let table = FlightTableFactory::new(driver.clone())
+        .with_channel_provider(Arc::new(DelayedChannelProvider(Duration::ZERO)))
+        .with_options(
+            FlightFactoryOptions::new()
+                .with_properties(FlightProperties::new().with_reusable_flight_info(reusable)),
+        )
+        .open_table(ORIGIN, options())
+        .await
+        .unwrap();
+    let ctx = SessionContext::new();
+    for _ in 0..2 {
+        let plan = table.scan(&ctx.state(), None, &[], None).await.unwrap();
+        assert_eq!(plan.schema(), batch(7).schema());
+        assert!(matches!(
+            plan.properties().boundedness,
+            Boundedness::Bounded
+        ));
+        let stats = table.statistics().unwrap();
+        assert_eq!(stats.num_rows, Precision::Exact(17));
+        assert_eq!(stats.total_byte_size, Precision::Exact(99));
+    }
+    assert_eq!(
+        driver.calls.load(Ordering::SeqCst),
+        if reusable { 1 } else { 3 }
+    );
+}
+
+#[derive(Debug)]
+struct PendingMetadataDriver {
+    calls: AtomicUsize,
+    info: FlightInfo,
+    observed_options: Mutex<Vec<HashMap<String, String>>>,
+    started: [Notify; 2],
+    release: [Notify; 2],
+}
+
+#[async_trait]
+impl FlightDriver for PendingMetadataDriver {
+    async fn metadata(
+        &self,
+        _client: FlightServiceClient<Channel>,
+        properties: FlightProperties,
+        options: &HashMap<String, String>,
+    ) -> arrow_flight::error::Result<FlightMetadata> {
+        self.observed_options.lock().unwrap().push(options.clone());
+        let call = self.calls.fetch_add(1, Ordering::SeqCst);
+        let mut info = self.info.clone();
+        if call > 0 {
+            let index = call - 1;
+            self.started[index].notify_one();
+            self.release[index].notified().await;
+            info.endpoint[0].ticket = Some(arrow_flight::Ticket::new(vec![call as u8]));
+        }
+        let properties = properties
+            .with_grpc_headers(HashMap::from([("x-response".into(), call.to_string())]))
+            .with_unbounded_streams(call == 1);
+        FlightMetadata::try_new(info, properties)
+    }
+}
+
+#[tokio::test]
+async fn concurrent_refreshes_keep_options_immutable() {
+    let driver = Arc::new(PendingMetadataDriver {
+        calls: AtomicUsize::new(0),
+        info: test_service(batch(7), vec![vec![]]).flight_info.clone(),
+        observed_options: Mutex::new(vec![]),
+        started: [Notify::new(), Notify::new()],
+        release: [Notify::new(), Notify::new()],
+    });
+    let original_options = options();
+    let table = FlightTableFactory::new(driver.clone())
+        .with_channel_provider(Arc::new(DelayedChannelProvider(Duration::ZERO)))
+        .open_table(ORIGIN, original_options.clone())
+        .await
+        .unwrap();
+    driver.observed_options.lock().unwrap().clear();
+    let ctx = SessionContext::new();
+    let state = ctx.state();
+    let mut first = Box::pin(table.scan(&state, None, &[], None));
+    let mut second = Box::pin(table.scan(&state, None, &[], None));
+    tokio::select! {
+        biased;
+        _ = driver.started[0].notified() => {}
+        _ = &mut first => panic!("first refresh completed before release"),
+        _ = sleep(Duration::from_secs(5)) => panic!("first refresh did not start"),
+    }
+    tokio::select! {
+        biased;
+        _ = driver.started[1].notified() => {}
+        _ = &mut second => panic!("second refresh completed before release"),
+        _ = sleep(Duration::from_secs(5)) => panic!("second refresh did not start"),
+    }
+    driver.release[1].notify_one();
+    let second_plan = tokio::time::timeout(Duration::from_secs(5), second)
+        .await
+        .unwrap()
+        .unwrap();
+    driver.release[0].notify_one();
+    let first_plan = tokio::time::timeout(Duration::from_secs(5), first)
+        .await
+        .unwrap()
+        .unwrap();
+
+    let codec = FlightPhysicalCodec::default();
+    for (plan, call) in [(first_plan, 1), (second_plan, 2)] {
+        assert_eq!(plan.schema(), batch(7).schema());
+        assert_eq!(
+            matches!(plan.properties().boundedness, Boundedness::Unbounded { .. }),
+            call == 1
+        );
+        let mut bytes = vec![];
+        codec.try_encode(plan, &mut bytes).unwrap();
+        let config: serde_json::Value = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(config["partitions"][0]["ticket"], serde_json::json!([call]));
+        assert_eq!(
+            config["properties"]["grpc_headers"]["x-response"],
+            call.to_string()
+        );
+    }
+    let observed_options = driver.observed_options.lock().unwrap().clone();
+    assert_eq!(observed_options, vec![original_options; 2]);
+    assert_eq!(driver.calls.load(Ordering::SeqCst), 3);
 }
 
 #[test_log::test(tokio::test)]
