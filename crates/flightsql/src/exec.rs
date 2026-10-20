@@ -33,8 +33,9 @@ use datafusion::arrow::compute::cast;
 use datafusion::arrow::datatypes::ToByteSlice;
 use datafusion::arrow::datatypes::{Field, SchemaRef};
 use datafusion::arrow::error::ArrowError;
+use datafusion::arrow::record_batch::RecordBatchOptions;
+use datafusion::common::DataFusionError;
 use datafusion::common::Result;
-use datafusion::common::{project_schema, DataFusionError};
 use datafusion::execution::{SendableRecordBatchStream, TaskContext};
 use datafusion::physical_expr::{EquivalenceProperties, Partitioning};
 use datafusion::physical_plan::execution_plan::{Boundedness, EmissionType};
@@ -55,11 +56,11 @@ pub(crate) struct FlightExec {
 }
 
 impl FlightExec {
-    /// Creates a FlightExec with the provided [FlightMetadata]
-    /// and origin URL (used as fallback location as per the protocol spec).
+    /// Creates a FlightExec with an explicit output schema and the provided [FlightMetadata].
+    /// Uses the origin URL as the fallback location as per the protocol spec.
     pub(crate) fn try_new(
         metadata: &FlightMetadata,
-        projection: Option<&Vec<usize>>,
+        output_schema: SchemaRef,
         origin: &str,
         size_limits: SizeLimits,
         channel_provider: Arc<dyn FlightChannelProvider>,
@@ -70,10 +71,9 @@ impl FlightExec {
             .iter()
             .map(|endpoint| FlightPartition::new(endpoint, origin.to_string()))
             .collect();
-        let schema = project_schema(&metadata.schema, projection)?;
         let config = FlightConfig {
             origin: origin.into(),
-            schema,
+            schema: output_schema,
             partitions,
             properties: metadata.props.clone(),
             size_limits,
@@ -238,14 +238,21 @@ async fn try_fetch_stream(
 
 /// Best-effort morphing of a record batch into a new schema.
 /// - drops columns if the corresponding field is missing from the target schema
+/// - preserves row counts in zero-column batches when the target schema is empty
 /// - attempts a column-wise cast if data types are different
 /// - generates missing columns as all-nulls if the corresponding field is nullable
 pub fn enforce_schema(
     batch: RecordBatch,
     target_schema: &SchemaRef,
 ) -> datafusion::arrow::error::Result<RecordBatch> {
-    if target_schema.fields.is_empty() || batch.schema() == *target_schema {
+    if batch.schema() == *target_schema {
         Ok(batch)
+    } else if target_schema.fields.is_empty() {
+        RecordBatch::try_new_with_options(
+            target_schema.to_owned(),
+            vec![],
+            &RecordBatchOptions::new().with_row_count(Some(batch.num_rows())),
+        )
     } else if target_schema.contains(batch.schema_ref()) {
         batch.with_schema(target_schema.to_owned())
     } else {
@@ -341,12 +348,14 @@ impl ExecutionPlan for FlightExec {
 
 #[cfg(test)]
 mod tests {
-    use crate::exec::{enforce_schema, FlightConfig, FlightPartition, FlightTicket};
-    use crate::{FlightProperties, SizeLimits};
+    use crate::exec::{enforce_schema, FlightConfig, FlightExec, FlightPartition, FlightTicket};
+    use crate::{DefaultFlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
+    use arrow_flight::FlightInfo;
     use datafusion::arrow::array::{
-        BooleanArray, Float32Array, Int32Array, RecordBatch, StringArray, StructArray,
+        BooleanArray, Float32Array, Int32Array, Int64Array, RecordBatch, StringArray, StructArray,
     };
     use datafusion::arrow::datatypes::{DataType, Field, Fields, Schema};
+    use datafusion::physical_plan::ExecutionPlan;
     use std::collections::HashMap;
     use std::sync::Arc;
 
@@ -386,6 +395,67 @@ mod tests {
     }
 
     #[test]
+    fn zero_column_adaptation_preserves_rows() {
+        let placeholder_schema =
+            Arc::new(Schema::new(vec![Field::new("1", DataType::Int64, false)]));
+        let output_schema = Arc::new(
+            Schema::empty().with_metadata(HashMap::from([("source".into(), "fixture".into())])),
+        );
+        let mut total_rows = 0;
+        for rows in [3, 0, 2] {
+            let batch = RecordBatch::try_new(
+                placeholder_schema.clone(),
+                vec![Arc::new(Int64Array::from(vec![1; rows]))],
+            )
+            .unwrap();
+            let adapted = enforce_schema(batch, &output_schema).unwrap();
+            assert_eq!(adapted.num_columns(), 0);
+            assert_eq!(adapted.num_rows(), rows);
+            assert_eq!(adapted.schema(), output_schema);
+            total_rows += adapted.num_rows();
+        }
+        assert_eq!(total_rows, 5);
+    }
+
+    #[test]
+    fn explicit_schema_does_not_reapply_projection() {
+        let canonical_schema = Arc::new(Schema::new(vec![
+            Field::new("a", DataType::Int32, false),
+            Field::new("b", DataType::Boolean, false),
+            Field::new("c", DataType::Int64, false),
+        ]));
+        let output_schema = Arc::new(Schema::new(vec![
+            Field::new("c", DataType::Int64, false),
+            Field::new("a", DataType::Int32, false),
+        ]));
+        let remote_batch = RecordBatch::try_new(
+            output_schema.clone(),
+            vec![
+                Arc::new(Int64Array::from(vec![30, 31])),
+                Arc::new(Int32Array::from(vec![10, 11])),
+            ],
+        )
+        .unwrap();
+        let info = FlightInfo::new()
+            .try_with_schema(output_schema.as_ref())
+            .unwrap();
+        let metadata = FlightMetadata::new(info, FlightProperties::new(), canonical_schema);
+        let explicit = FlightExec::try_new(
+            &metadata,
+            output_schema.clone(),
+            "http://origin.invalid",
+            SizeLimits::default(),
+            Arc::new(DefaultFlightChannelProvider),
+        )
+        .unwrap();
+        assert_eq!(explicit.schema(), output_schema);
+        assert_eq!(
+            enforce_schema(remote_batch.clone(), &explicit.schema()).unwrap(),
+            remote_batch
+        );
+    }
+
+    #[test]
     fn test_schema_enforcement() {
         let data = StructArray::new(
             Fields::from(vec![
@@ -399,11 +469,6 @@ mod tests {
             None,
         );
         let input_rb = RecordBatch::from(data);
-
-        let empty_schema = Arc::new(Schema::empty());
-        let same_rb =
-            enforce_schema(input_rb.clone(), &empty_schema).expect("error enforcing empty schema");
-        assert_eq!(input_rb, same_rb);
 
         let coerced_rb = enforce_schema(
             input_rb.clone(),

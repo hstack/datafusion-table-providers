@@ -90,3 +90,123 @@ impl PhysicalExtensionCodec for FlightPhysicalCodec {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::sync::Arc;
+
+    use arrow_flight::{FlightEndpoint, FlightInfo, Location, Ticket};
+    use datafusion::arrow::datatypes::{DataType, Field, Schema};
+    use datafusion::execution::TaskContext;
+    use datafusion::physical_plan::ExecutionPlanProperties;
+    use datafusion_proto::physical_plan::PhysicalExtensionCodec;
+    use serde_json::json;
+
+    use super::FlightPhysicalCodec;
+    use crate::exec::FlightExec;
+    use crate::{DefaultFlightChannelProvider, FlightMetadata, FlightProperties, SizeLimits};
+
+    #[test]
+    fn explicit_schema_round_trip_preserves_execution_configuration() {
+        let projected_schema = Schema::new(vec![
+            Field::new("c", DataType::Int64, true),
+            Field::new("a", DataType::Int32, false),
+        ]);
+        for schema in [projected_schema, Schema::empty()] {
+            let output_schema = Arc::new(
+                schema.with_metadata(HashMap::from([("source".into(), "fixture".into())])),
+            );
+            let remote_schema = if output_schema.fields().is_empty() {
+                Schema::new(vec![Field::new("1", DataType::Int64, false)])
+            } else {
+                output_schema.as_ref().clone()
+            };
+            let info = FlightInfo::new()
+                .try_with_schema(&remote_schema)
+                .unwrap()
+                .with_endpoint(FlightEndpoint::new().with_ticket(Ticket::new(vec![0, 1, 2])))
+                .with_endpoint(FlightEndpoint {
+                    ticket: Some(Ticket::new(vec![3, 4])),
+                    location: vec![
+                        Location {
+                            uri: "arrow-flight-reuse-connection://?".into(),
+                        },
+                        Location {
+                            uri: "http://alternate.invalid".into(),
+                        },
+                    ],
+                    ..Default::default()
+                })
+                .with_endpoint(FlightEndpoint {
+                    ticket: Some(Ticket::new(vec![5, 255])),
+                    location: vec![
+                        Location {
+                            uri: "http://data-a.invalid".into(),
+                        },
+                        Location {
+                            uri: "http://data-b.invalid".into(),
+                        },
+                    ],
+                    ..Default::default()
+                });
+            let properties = FlightProperties::new()
+                .with_reusable_flight_info(true)
+                .with_unbounded_streams(true)
+                .with_grpc_headers(HashMap::from([
+                    ("authorization".into(), "Bearer fixture".into()),
+                    ("x-fixture".into(), "codec".into()),
+                ]));
+            let metadata = FlightMetadata::try_new(info, properties).unwrap();
+            let exec = FlightExec::try_new(
+                &metadata,
+                output_schema.clone(),
+                "http://origin.invalid",
+                SizeLimits::new(1024, 2048),
+                Arc::new(DefaultFlightChannelProvider),
+            )
+            .unwrap();
+            let codec = FlightPhysicalCodec::default();
+            let mut bytes = vec![];
+            codec.try_encode(Arc::new(exec), &mut bytes).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap(),
+                json!({
+                    "origin": "http://origin.invalid",
+                    "schema": output_schema,
+                    "partitions": [
+                        {"locations": ["http://origin.invalid"], "ticket": [0, 1, 2]},
+                        {
+                            "locations": ["http://origin.invalid", "http://alternate.invalid"],
+                            "ticket": [3, 4]
+                        },
+                        {
+                            "locations": ["http://data-a.invalid", "http://data-b.invalid"],
+                            "ticket": [5, 255]
+                        }
+                    ],
+                    "properties": {
+                        "unbounded_streams": true,
+                        "grpc_headers": {
+                            "authorization": "Bearer fixture",
+                            "x-fixture": "codec"
+                        },
+                        "reusable_flight_info": true
+                    },
+                    "size_limits": {"encoding": 1024, "decoding": 2048}
+                })
+            );
+            let decoded = codec
+                .try_decode(&bytes, &[], &TaskContext::default())
+                .unwrap();
+            assert_eq!(decoded.schema(), output_schema);
+            assert_eq!(decoded.output_partitioning().partition_count(), 3);
+            let mut reencoded = vec![];
+            codec.try_encode(decoded, &mut reencoded).unwrap();
+            assert_eq!(
+                serde_json::from_slice::<serde_json::Value>(&reencoded).unwrap(),
+                serde_json::from_slice::<serde_json::Value>(&bytes).unwrap()
+            );
+        }
+    }
+}

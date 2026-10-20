@@ -33,7 +33,7 @@ use async_trait::async_trait;
 use datafusion::arrow::datatypes::SchemaRef;
 use datafusion::catalog::{Session, TableProviderFactory};
 use datafusion::common::stats::Precision;
-use datafusion::common::{DataFusionError, Statistics};
+use datafusion::common::{project_schema, DataFusionError, Statistics};
 use datafusion::datasource::TableProvider;
 use datafusion::logical_expr::{CreateExternalTable, Expr, TableType};
 use datafusion::physical_plan::ExecutionPlan;
@@ -445,9 +445,10 @@ impl TableProvider for FlightTable {
         _limit: Option<usize>,
     ) -> datafusion::common::Result<Arc<dyn ExecutionPlan>> {
         let metadata = self.metadata_supplier.flight_metadata(&self.origin).await?;
+        let output_schema = project_schema(&metadata.schema, projection)?;
         Ok(Arc::new(FlightExec::try_new(
             metadata.as_ref(),
-            projection,
+            output_schema,
             &self.origin,
             self.size_limits,
             self.channel_provider.clone(),
