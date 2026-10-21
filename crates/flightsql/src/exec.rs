@@ -208,7 +208,13 @@ async fn flight_stream(
             )
             .await
         };
-        let client = run_async_with_tokio(get_client).await?;
+        let client = match run_async_with_tokio(get_client).await {
+            Ok(client) => client,
+            Err(error) => {
+                errors.push(Box::new(error));
+                continue;
+            }
+        };
         match try_fetch_stream(client, &partition.ticket, schema.clone()).await {
             Ok(stream) => return Ok(stream),
             Err(e) => errors.push(Box::new(e)),
