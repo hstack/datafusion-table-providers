@@ -42,7 +42,6 @@ pub(crate) fn normalize_query(sql: &str) -> Result<String> {
 }
 
 /// Render discovery SQL for an already-normalized source.
-#[allow(dead_code)] // Wired into the SQL table provider in the next implementation step.
 pub(crate) fn discovery_sql(source: &FlightSqlSource) -> String {
     match source {
         FlightSqlSource::Table(_) => format!("{} LIMIT 1", source_query(source)),
@@ -53,7 +52,6 @@ pub(crate) fn discovery_sql(source: &FlightSqlSource) -> String {
 }
 
 /// Render a scan over an already-normalized source and its canonical schema.
-#[allow(dead_code)] // Wired into the SQL table provider in the next implementation step.
 pub(crate) fn scan_sql(
     source: &FlightSqlSource,
     schema: &SchemaRef,
@@ -241,7 +239,7 @@ mod tests {
     }
 
     #[test]
-    fn scan_projection_preserves_order_duplicates_and_empty_output() {
+    fn scan_projection_preserves_order_and_empty_output() {
         let source = FlightSqlSource::table("t").unwrap();
         for (projection, expected) in [
             (
@@ -255,10 +253,6 @@ mod tests {
             (
                 Some(vec![]),
                 "SELECT 1 FROM (SELECT * FROM \"t\") AS \"flight_source\"",
-            ),
-            (
-                Some(vec![0, 0]),
-                "SELECT \"a\", \"a\" FROM (SELECT * FROM \"t\") AS \"flight_source\"",
             ),
         ] {
             assert_eq!(

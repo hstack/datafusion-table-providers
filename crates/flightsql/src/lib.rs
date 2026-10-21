@@ -17,6 +17,7 @@
 
 //! Generic [FlightTableFactory] that can connect to Arrow Flight services,
 //! with a [sql::FlightSqlDriver] provided out-of-the-box.
+//! [FlightSqlTableFactory] adds typed SQL sources, schema discovery, and scan projection.
 
 use std::collections::HashMap;
 use std::error::Error;
@@ -50,7 +51,9 @@ mod sql_provider;
 
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::enforce_schema;
-pub use sql_provider::{FlightSqlSource, FlightSqlTableOptions};
+pub use sql_provider::{
+    FlightSqlSource, FlightSqlTable, FlightSqlTableFactory, FlightSqlTableOptions,
+};
 
 /// Generic Arrow Flight data source. Requires a [FlightDriver] that allows implementors
 /// to integrate any custom Flight RPC service by producing a [FlightMetadata] for some DDL.

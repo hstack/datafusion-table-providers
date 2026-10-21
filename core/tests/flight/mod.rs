@@ -35,6 +35,7 @@ use datafusion_table_providers::flight::{
 
 mod channel_provider;
 mod size_limits;
+mod sql_provider;
 mod timeouts;
 
 const QUERY: &str = "SELECT id FROM test";
