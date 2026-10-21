@@ -102,6 +102,10 @@ impl SqlProviderFixture {
                 vec![Arc::new(StringArray::from(vec!["a''b", "a'b", "x"]))],
             )?,
         )?;
+        Self::start_with_context(context).await
+    }
+
+    pub async fn start_with_context(context: SessionContext) -> Result<Self> {
         let state = Arc::new(FixtureState {
             context,
             requests: Mutex::new(vec![]),

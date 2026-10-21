@@ -3,13 +3,14 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
+use datafusion::arrow::array::{Array, BooleanArray, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
-use datafusion::common::{DataFusionError, Result};
+use datafusion::common::{DataFusionError, Result, ScalarValue};
+use datafusion::datasource::MemTable;
 use datafusion::logical_expr::{TableProviderFilterPushDown, TableType};
 use datafusion::physical_plan::collect;
-use datafusion::prelude::{col, lit, SessionContext};
+use datafusion::prelude::{col, lit, SessionConfig, SessionContext};
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, QUERY};
 use datafusion_table_providers::flight::{
     FlightChannelProvider, FlightFactoryOptions, FlightProperties, FlightSqlSource,
@@ -50,6 +51,232 @@ fn int_values(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>> {
                 .iter()
         })
         .collect()
+}
+
+async fn optimizer_fixture(
+    source: FlightSqlSource,
+) -> Result<(SqlProviderFixture, SessionContext, SessionContext)> {
+    let schema = Arc::new(Schema::new(vec![
+        Field::new("id", DataType::Int64, false),
+        Field::new("score", DataType::Int64, true),
+        Field::new("enabled", DataType::Boolean, true),
+    ]));
+    let batch = RecordBatch::try_new(
+        schema.clone(),
+        vec![
+            Arc::new(Int64Array::from(vec![1, 2, 3, 4, 5, 5, 6, 7, 8, 9, 10])),
+            Arc::new(Int64Array::from(vec![
+                None,
+                Some(-10),
+                Some(0),
+                Some(10),
+                Some(20),
+                Some(20),
+                Some(i64::MAX),
+                Some(i64::MIN),
+                Some(-1),
+                Some(1),
+                None,
+            ])),
+            Arc::new(BooleanArray::from(vec![
+                None,
+                Some(false),
+                Some(true),
+                None,
+                Some(false),
+                Some(false),
+                Some(true),
+                Some(false),
+                None,
+                Some(true),
+                Some(true),
+            ])),
+        ],
+    )?;
+    // Put identical rows in different batches so comparisons must retain multiplicity.
+    let table = Arc::new(MemTable::try_new(
+        schema.clone(),
+        vec![vec![batch.slice(0, 5), batch.slice(5, 6)]],
+    )?);
+    let empty = Arc::new(MemTable::try_new(schema, vec![vec![]])?);
+    // Avoid reordering unordered LIMIT/OFFSET inputs without adding a sort barrier.
+    let config = SessionConfig::new().with_target_partitions(1);
+    let server = SessionContext::new_with_config(config.clone());
+    let baseline = SessionContext::new_with_config(config.clone());
+    for context in [&server, &baseline] {
+        context.register_table("cases", table.clone())?;
+        context.register_table("empty_cases", empty.clone())?;
+    }
+    let local_source = match &source {
+        FlightSqlSource::Table(name) => baseline.table(name.as_str()).await?,
+        FlightSqlSource::Query(query) => baseline.sql(query).await?,
+    };
+    baseline.register_table("remote", local_source.into_view())?;
+    let fixture = SqlProviderFixture::start_with_context(server).await?;
+    let remote = factory()
+        .with_table_options(FlightSqlTableOptions::default().with_datafusion_compatible_pushdown())
+        .open_table(fixture.endpoint(), source, options())
+        .await?;
+    let optimized = SessionContext::new_with_config(config);
+    optimized.register_table("remote", Arc::new(remote))?;
+    Ok((fixture, optimized, baseline))
+}
+
+async fn sorted_rows(context: &SessionContext, sql: &str) -> Result<Vec<Vec<ScalarValue>>> {
+    let batches = context.sql(sql).await?.collect().await?;
+    let mut rows = Vec::new();
+    for batch in batches {
+        for row in 0..batch.num_rows() {
+            rows.push(
+                batch
+                    .columns()
+                    .iter()
+                    .map(|column| ScalarValue::try_from_array(column, row))
+                    .collect::<Result<Vec<_>>>()?,
+            );
+        }
+    }
+    rows.sort_by_cached_key(|row| format!("{row:?}"));
+    Ok(rows)
+}
+
+async fn assert_query_matches_baseline(
+    fixture: &SqlProviderFixture,
+    optimized: &SessionContext,
+    baseline: &SessionContext,
+    sql: &str,
+) -> Result<String> {
+    let start = fixture.requests().len();
+    let expected = sorted_rows(baseline, sql).await?;
+    let actual = sorted_rows(optimized, sql).await?;
+    let requests = fixture.requests();
+    let scans = requests[start..]
+        .iter()
+        .filter_map(|request| request.sql.as_deref())
+        .collect::<Vec<_>>();
+    assert_eq!(scans.len(), 1, "{sql}: {requests:?}");
+    assert_eq!(actual, expected, "{sql}\nscan: {}", scans[0]);
+    Ok(scans[0].to_owned())
+}
+
+#[tokio::test]
+async fn residual_filters_prevent_remote_limits() -> Result<()> {
+    for source in [
+        FlightSqlSource::table("cases")?,
+        FlightSqlSource::query("SELECT * FROM cases")?,
+    ] {
+        let table_source = matches!(source, FlightSqlSource::Table(_));
+        let (fixture, optimized, baseline) = optimizer_fixture(source).await?;
+        for (predicate, pushable) in [
+            ("score >= 0", true),
+            ("length(CAST(score AS VARCHAR)) = 2", false),
+            ("score >= 0 AND length(CAST(score AS VARCHAR)) = 2", true),
+        ] {
+            for bound in ["LIMIT 1", "LIMIT 2 OFFSET 1"] {
+                let sql = format!("SELECT id FROM remote WHERE {predicate} {bound}");
+                let scan =
+                    assert_query_matches_baseline(&fixture, &optimized, &baseline, &sql).await?;
+                assert!(!scan.contains(" LIMIT "), "{scan}");
+                assert!(!scan.contains(" OFFSET "), "{scan}");
+                assert_eq!(scan.contains(" WHERE "), table_source && pushable, "{scan}");
+                assert!(!scan.contains("length("), "{scan}");
+            }
+        }
+        fixture.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn inexact_filters_keep_residual_columns() -> Result<()> {
+    let (fixture, optimized, baseline) =
+        optimizer_fixture(FlightSqlSource::table("cases")?).await?;
+    let scan = assert_query_matches_baseline(
+        &fixture,
+        &optimized,
+        &baseline,
+        "SELECT r.id FROM remote AS r WHERE r.score >= 10 LIMIT 2",
+    )
+    .await?;
+    assert!(
+        scan.starts_with("SELECT \"id\", \"score\" FROM \"cases\" WHERE "),
+        "{scan}"
+    );
+    assert!(!scan.contains("\"enabled\""), "{scan}");
+    assert!(!scan.contains("\"r\"."), "{scan}");
+    assert!(!scan.contains(" LIMIT "), "{scan}");
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+async fn boolean_trees_have_no_false_negatives() -> Result<()> {
+    for source in [
+        FlightSqlSource::table("cases")?,
+        FlightSqlSource::query("SELECT * FROM cases")?,
+    ] {
+        let table_source = matches!(source, FlightSqlSource::Table(_));
+        let (fixture, optimized, baseline) = optimizer_fixture(source).await?;
+        for (predicate, pushable) in [
+            ("score IS NULL OR score = -9223372036854775808", true),
+            ("score IN (-9223372036854775808, 9223372036854775807)", true),
+            ("NOT (score > 0 OR enabled)", true),
+            ("(score < 0 OR enabled) AND NOT (score = 0)", true),
+            ("enabled IS TRUE OR enabled IS NULL", true),
+            ("NOT enabled", true),
+            ("(score >= 0 AND enabled) OR score IS NULL", true),
+            ("score < 0 OR score >= 10 AND enabled = false", true),
+            ("score = 20 OR length(CAST(id AS VARCHAR)) = 2", false),
+            ("NOT (score > 0 AND length(CAST(id AS VARCHAR)) = 1)", false),
+        ] {
+            for bound in ["", "LIMIT 1", "LIMIT 2 OFFSET 1"] {
+                let sql =
+                    format!("SELECT id, score, enabled FROM remote WHERE {predicate} {bound}");
+                let scan =
+                    assert_query_matches_baseline(&fixture, &optimized, &baseline, &sql).await?;
+                assert_eq!(scan.contains(" WHERE "), table_source && pushable, "{scan}");
+                assert!(!scan.contains(" LIMIT "), "{scan}");
+                assert!(!scan.contains(" OFFSET "), "{scan}");
+            }
+        }
+        fixture.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn query_outer_filter_is_never_remote() -> Result<()> {
+    let query = "SELECT id, score, enabled FROM cases WHERE score IS NOT NULL ORDER BY id LIMIT 6";
+    let (fixture, optimized, baseline) = optimizer_fixture(FlightSqlSource::query(query)?).await?;
+    for bound in ["LIMIT 1", "LIMIT 2 OFFSET 1"] {
+        let sql = format!("SELECT id FROM remote WHERE score >= 20 {bound}");
+        let scan = assert_query_matches_baseline(&fixture, &optimized, &baseline, &sql).await?;
+        assert_eq!(scan, format!("SELECT \"id\", \"score\" FROM ({query})"));
+    }
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+async fn constant_and_count_outputs_preserve_source_multiplicity() -> Result<()> {
+    for source in [
+        FlightSqlSource::table("cases")?,
+        FlightSqlSource::table("empty_cases")?,
+        FlightSqlSource::query("SELECT * FROM cases")?,
+        FlightSqlSource::query("SELECT * FROM empty_cases")?,
+    ] {
+        let (fixture, optimized, baseline) = optimizer_fixture(source).await?;
+        for sql in [
+            "SELECT COUNT(*) AS n FROM remote",
+            "SELECT 1 AS one FROM remote",
+        ] {
+            let scan = assert_query_matches_baseline(&fixture, &optimized, &baseline, sql).await?;
+            assert!(scan.starts_with("SELECT 1 FROM "), "{scan}");
+            assert!(!scan.contains(" WHERE "), "{scan}");
+            assert!(!scan.contains(" LIMIT "), "{scan}");
+            assert!(!scan.contains(" OFFSET "), "{scan}");
+        }
+        fixture.shutdown().await?;
+    }
+    Ok(())
 }
 
 #[tokio::test]
