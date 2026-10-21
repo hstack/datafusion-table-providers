@@ -9,7 +9,7 @@ use arrow_flight::sql::server::FlightSqlService;
 use arrow_flight::sql::{CommandStatementQuery, ProstMessageExt, SqlInfo, TicketStatementQuery};
 use arrow_flight::{FlightDescriptor, FlightEndpoint, FlightInfo, Ticket};
 use async_trait::async_trait;
-use datafusion::arrow::array::{BooleanArray, Int64Array, RecordBatch};
+use datafusion::arrow::array::{BooleanArray, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
 use datafusion::common::{DataFusionError, Result};
 use datafusion::datasource::MemTable;
@@ -90,6 +90,18 @@ impl SqlProviderFixture {
             Arc::new(MemTable::try_new(schema.clone(), vec![vec![batch]])?),
         )?;
         context.register_table("empty", Arc::new(MemTable::try_new(schema, vec![vec![]])?))?;
+        let string_schema = Arc::new(Schema::new(vec![Field::new(
+            "a\"\"b",
+            DataType::Utf8,
+            false,
+        )]));
+        context.register_batch(
+            "literal_names",
+            RecordBatch::try_new(
+                string_schema,
+                vec![Arc::new(StringArray::from(vec!["a''b", "a'b", "x"]))],
+            )?,
+        )?;
         let state = Arc::new(FixtureState {
             context,
             requests: Mutex::new(vec![]),

@@ -33,7 +33,7 @@ use tonic::transport::Channel;
 use crate::access::{connect_and_fetch_metadata, fetch_metadata};
 use crate::exec::FlightExec;
 use crate::sql::{FlightSqlDriver, QUERY};
-use crate::sql_gen::{discovery_sql, normalize_query, scan_sql};
+use crate::sql_gen::{classify_filter, discovery_sql, normalize_query, scan_sql};
 use crate::{DefaultFlightChannelProvider, FlightChannelProvider, FlightFactoryOptions};
 
 /// A literal remote table identifier or a query used as a derived relation.
@@ -90,7 +90,15 @@ pub struct FlightSqlTableOptions {
 }
 
 impl FlightSqlTableOptions {
-    /// Select the narrow DataFusion-compatible signed-integer/boolean predicate policy.
+    /// Enable renderable table predicates with a DataFusion-compatible function allowlist.
+    ///
+    /// The remote SQL engine must support the emitted expressions and allowlisted
+    /// functions with compatible semantics. This setting does not discover server
+    /// capabilities. Filters remain inexact and are rechecked locally; DataFusion
+    /// controls safe limit pushdown.
+    ///
+    /// Allowlisted functions: `abs`, `ceil`, `floor`, `round`, `sqrt`, `exp`,
+    /// `ln`, `power`, `lower`, `upper`, and `coalesce`.
     ///
     /// Query-source outer filters remain local regardless of this setting.
     pub fn with_datafusion_compatible_pushdown(mut self) -> Self {
@@ -98,7 +106,6 @@ impl FlightSqlTableOptions {
         self
     }
 
-    #[allow(dead_code)] // Consumed by the predicate classifier in a later implementation step.
     pub(crate) fn pushdown_enabled(&self) -> bool {
         self.datafusion_compatible_pushdown
     }
@@ -257,7 +264,6 @@ impl TableProvider for FlightSqlTable {
             projection.map(Vec::as_slice),
             filters,
             limit,
-            &self.table_options,
         )?;
         let mut options = self.options.clone();
         options.insert(QUERY.into(), query);
@@ -286,10 +292,10 @@ impl TableProvider for FlightSqlTable {
         &self,
         filters: &[&Expr],
     ) -> Result<Vec<TableProviderFilterPushDown>> {
-        Ok(vec![
-            TableProviderFilterPushDown::Unsupported;
-            filters.len()
-        ])
+        filters
+            .iter()
+            .map(|filter| classify_filter(&self.source, &self.table_options, filter))
+            .collect()
     }
 
     fn statistics(&self) -> Option<Statistics> {

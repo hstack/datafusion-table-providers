@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use async_trait::async_trait;
-use datafusion::arrow::array::{Array, Int64Array, RecordBatch};
+use datafusion::arrow::array::{Array, Int64Array, RecordBatch, StringArray};
 use datafusion::arrow::datatypes::{DataType, Field, Schema};
 use datafusion::catalog::TableProvider;
 use datafusion::common::{DataFusionError, Result};
@@ -13,7 +13,7 @@ use datafusion::prelude::{col, lit, SessionContext};
 use datafusion_table_providers::flight::sql::{FlightSqlDriver, QUERY};
 use datafusion_table_providers::flight::{
     FlightChannelProvider, FlightFactoryOptions, FlightProperties, FlightSqlSource,
-    FlightSqlTableFactory,
+    FlightSqlTableFactory, FlightSqlTableOptions,
 };
 use tonic::transport::Channel;
 
@@ -53,6 +53,147 @@ fn int_values(batches: &[RecordBatch], column: usize) -> Vec<Option<i64>> {
 }
 
 #[tokio::test]
+async fn opted_in_predicates_are_inexact_and_rendered_for_table_sources_only() -> Result<()> {
+    for (source, enabled, pushed) in [
+        (FlightSqlSource::table("t")?, true, true),
+        (FlightSqlSource::table("t")?, false, false),
+        (FlightSqlSource::query("SELECT * FROM t")?, true, false),
+    ] {
+        let fixture = SqlProviderFixture::start().await?;
+        let table_options = if enabled {
+            FlightSqlTableOptions::default().with_datafusion_compatible_pushdown()
+        } else {
+            FlightSqlTableOptions::default()
+        };
+        let table = factory()
+            .with_table_options(table_options)
+            .open_table(fixture.endpoint(), source, options())
+            .await?;
+        let filter = col("a").gt(lit(1_i64));
+        assert_eq!(
+            table.supports_filters_pushdown(&[&filter])?,
+            vec![if pushed {
+                TableProviderFilterPushDown::Inexact
+            } else {
+                TableProviderFilterPushDown::Unsupported
+            }]
+        );
+        assert_eq!(fixture.requests().len(), 1);
+        let ctx = SessionContext::new();
+        ctx.register_table("remote", Arc::new(table))?;
+        let batches = ctx
+            .sql("SELECT r.a FROM remote AS r WHERE (r.a > 1 AND r.c < 45) OR r.c IS NULL LIMIT 1")
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(int_values(&batches, 0), vec![Some(2)]);
+        let requests = fixture.requests();
+        let scan = requests
+            .iter()
+            .filter_map(|r| r.sql.as_deref())
+            .nth(1)
+            .unwrap();
+        assert_eq!(scan.contains(" WHERE "), pushed, "{scan}");
+        assert!(!scan.contains(" LIMIT "), "{scan}");
+        assert!(!scan.contains("\"r\"."), "{scan}");
+        if pushed {
+            assert!(
+                scan.starts_with("SELECT \"a\", \"c\" FROM \"t\" WHERE "),
+                "{scan}"
+            );
+            assert!(!scan.contains("flight_source"), "{scan}");
+        }
+        fixture.shutdown().await?;
+    }
+    Ok(())
+}
+
+#[tokio::test]
+async fn renderable_predicates_and_allowlisted_functions_are_pushed() -> Result<()> {
+    let fixture = SqlProviderFixture::start().await?;
+    let table = factory()
+        .with_table_options(FlightSqlTableOptions::default().with_datafusion_compatible_pushdown())
+        .open_table(fixture.endpoint(), FlightSqlSource::table("t")?, options())
+        .await?;
+    let ctx = SessionContext::new();
+    ctx.register_table("remote", Arc::new(table))?;
+    for (predicate, expected, pushed) in [
+        ("a > c", vec![], true),
+        ("abs(c - 35) < 10", vec![Some(3), Some(4)], true),
+        ("lower(CAST(a AS VARCHAR)) = '2'", vec![Some(2)], true),
+        (
+            "CAST(c AS DOUBLE) > 25.5",
+            vec![Some(3), Some(4), Some(5)],
+            true,
+        ),
+        ("coalesce(c, 0) = 0", vec![Some(2)], true),
+        (
+            "a = 2 OR length(CAST(a AS VARCHAR)) > 0",
+            vec![Some(1), Some(2), Some(3), Some(4), Some(5)],
+            false,
+        ),
+    ] {
+        let start = fixture.requests().len();
+        let batches = ctx
+            .sql(&format!(
+                "SELECT a FROM remote WHERE {predicate} ORDER BY a"
+            ))
+            .await?
+            .collect()
+            .await?;
+        assert_eq!(int_values(&batches, 0), expected, "{predicate}");
+        let requests = fixture.requests();
+        let scan = requests[start..]
+            .iter()
+            .find_map(|r| r.sql.as_deref())
+            .unwrap();
+        assert_eq!(scan.contains(" WHERE "), pushed, "{scan}");
+    }
+    fixture.shutdown().await
+}
+
+#[tokio::test]
+async fn pushed_predicates_preserve_literal_names_and_strings() -> Result<()> {
+    let fixture = SqlProviderFixture::start().await?;
+    let table = factory()
+        .with_table_options(FlightSqlTableOptions::default().with_datafusion_compatible_pushdown())
+        .open_table(
+            fixture.endpoint(),
+            FlightSqlSource::table("literal_names")?,
+            options(),
+        )
+        .await?;
+    let ctx = SessionContext::new();
+    ctx.register_table("remote", Arc::new(table))?;
+    let batches = ctx
+        .sql("SELECT \"a\"\"\"\"b\" FROM remote WHERE \"a\"\"\"\"b\" = 'a''''b'")
+        .await?
+        .collect()
+        .await?;
+    let values = batches
+        .iter()
+        .flat_map(|batch| {
+            batch
+                .column(0)
+                .as_any()
+                .downcast_ref::<StringArray>()
+                .unwrap()
+                .iter()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(values, vec![Some("a''b")]);
+    assert_eq!(
+        fixture
+            .requests()
+            .iter()
+            .filter_map(|r| r.sql.as_deref())
+            .nth(1),
+        Some("SELECT \"a\"\"\"\"b\" FROM \"literal_names\" WHERE (\"a\"\"\"\"b\" = 'a''''b')")
+    );
+    fixture.shutdown().await
+}
+
+#[tokio::test]
 async fn discovery_is_full_schema_and_never_fetched() -> Result<()> {
     let fixture = SqlProviderFixture::start().await?;
     let table = factory()
@@ -89,10 +230,6 @@ async fn discovery_is_full_schema_and_never_fetched() -> Result<()> {
         .scan(&ctx.state(), Some(&vec![3]), &[], None)
         .await
         .is_err());
-    assert!(table
-        .scan(&ctx.state(), None, &filters, None)
-        .await
-        .is_err());
     assert_eq!(fixture.requests().len(), 1);
     fixture.shutdown().await
 }
@@ -100,10 +237,10 @@ async fn discovery_is_full_schema_and_never_fetched() -> Result<()> {
 #[tokio::test]
 async fn scans_get_fresh_projected_tickets() -> Result<()> {
     for (source, base) in [
-        (FlightSqlSource::table("t")?, "SELECT * FROM \"t\""),
+        (FlightSqlSource::table("t")?, "\"t\""),
         (
             FlightSqlSource::query("SELECT a, b, c FROM t;")?,
-            "SELECT a, b, c FROM t",
+            "(SELECT a, b, c FROM t)",
         ),
     ] {
         let fixture = SqlProviderFixture::start().await?;
@@ -146,12 +283,7 @@ async fn scans_get_fresh_projected_tickets() -> Result<()> {
             );
             let last = fixture.requests().last().unwrap().clone();
             assert_eq!(last.operation, "GetFlightInfo");
-            assert_eq!(
-                last.sql,
-                Some(format!(
-                    "SELECT {selection} FROM ({base}) AS \"flight_source\""
-                ))
-            );
+            assert_eq!(last.sql, Some(format!("SELECT {selection} FROM {base}")));
             let batches = collect(plan, ctx.task_ctx()).await?;
             assert_eq!(batches.iter().map(RecordBatch::num_rows).sum::<usize>(), 5);
             for batch in &batches {
@@ -220,9 +352,7 @@ async fn query_aggregates_and_inner_limits_keep_their_scope() -> Result<()> {
             .await?;
         assert_eq!(
             fixture.requests()[0].sql,
-            Some(format!(
-                "SELECT * FROM ({query}) AS \"flight_source\" LIMIT 1"
-            ))
+            Some(format!("SELECT * FROM ({query}) LIMIT 1"))
         );
         assert!(table.statistics().is_none());
         let ctx = SessionContext::new();
@@ -232,9 +362,7 @@ async fn query_aggregates_and_inner_limits_keep_their_scope() -> Result<()> {
             .unwrap_or_default();
         assert_eq!(
             fixture.requests()[1].sql,
-            Some(format!(
-                "SELECT * FROM ({query}) AS \"flight_source\"{suffix}"
-            ))
+            Some(format!("SELECT * FROM ({query}){suffix}"))
         );
         assert_eq!(
             int_values(&collect(plan, ctx.task_ctx()).await?, 0),

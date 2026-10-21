@@ -18,13 +18,38 @@
 //! SQL source normalization and discovery/scan rendering.
 
 use datafusion::arrow::datatypes::SchemaRef;
+use datafusion::common::tree_node::TreeNode;
 use datafusion::common::{DataFusionError, Result};
-use datafusion::logical_expr::Expr;
-use datafusion::sql::sqlparser::ast::Statement;
+use datafusion::logical_expr::{Expr, TableProviderFilterPushDown};
+use datafusion::sql::sqlparser::ast::{Expr as SqlExpr, Statement, Value};
 use datafusion::sql::sqlparser::dialect::GenericDialect;
 use datafusion::sql::sqlparser::parser::{Parser, ParserOptions};
+use datafusion::sql::unparser::{dialect::Dialect, Unparser};
 
 use crate::{FlightSqlSource, FlightSqlTableOptions};
+
+const FLIGHT_SQL_PUSHABLE_FUNCTIONS: &[&str] = &[
+    "abs", "ceil", "floor", "round", "sqrt", "exp", "ln", "power", "lower", "upper", "coalesce",
+];
+
+// SQLParser preserves existing escape pairs; pre-escape raw Arrow names and values.
+struct FlightSqlDialect;
+
+impl Dialect for FlightSqlDialect {
+    fn identifier_quote_style(&self, _identifier: &str) -> Option<char> {
+        Some('"')
+    }
+
+    fn col_alias_overrides(&self, name: &str) -> Result<Option<String>> {
+        Ok(Some(escape_identifier(name)))
+    }
+
+    fn string_literal_to_sql(&self, value: &str) -> Option<SqlExpr> {
+        Some(SqlExpr::value(Value::SingleQuotedString(
+            value.replace('\'', "''"),
+        )))
+    }
+}
 
 pub(crate) fn normalize_query(sql: &str) -> Result<String> {
     // Preserve SQL escaping when rendering the parsed query back to SQL.
@@ -44,9 +69,11 @@ pub(crate) fn normalize_query(sql: &str) -> Result<String> {
 /// Render discovery SQL for an already-normalized source.
 pub(crate) fn discovery_sql(source: &FlightSqlSource) -> String {
     match source {
-        FlightSqlSource::Table(_) => format!("{} LIMIT 1", source_query(source)),
+        FlightSqlSource::Table(name) => {
+            format!("SELECT * FROM {} LIMIT 1", quote_identifier(name))
+        }
         FlightSqlSource::Query(query) => {
-            format!("SELECT * FROM ({query}) AS \"flight_source\" LIMIT 1")
+            format!("SELECT * FROM ({query}) LIMIT 1")
         }
     }
 }
@@ -58,13 +85,7 @@ pub(crate) fn scan_sql(
     projection: Option<&[usize]>,
     filters: &[Expr],
     limit: Option<usize>,
-    _table_options: &FlightSqlTableOptions,
 ) -> Result<String> {
-    if !filters.is_empty() {
-        return Err(DataFusionError::Plan(
-            "Flight SQL scan filters are not supported".into(),
-        ));
-    }
     let projection = match projection {
         None => "*".into(),
         Some([]) => "1".into(),
@@ -82,38 +103,77 @@ pub(crate) fn scan_sql(
             .collect::<Result<Vec<_>>>()?
             .join(", "),
     };
-    let mut sql = format!(
-        "SELECT {projection} FROM ({}) AS \"flight_source\"",
-        source_query(source)
-    );
+
+    let relation = match source {
+        FlightSqlSource::Table(name) => quote_identifier(name),
+        FlightSqlSource::Query(query) => format!("({query})"),
+    };
+    let mut sql = format!("SELECT {projection} FROM {relation}");
+
+    if let Some(predicate) = filters.iter().cloned().reduce(Expr::and) {
+        let predicate = Unparser::new(&FlightSqlDialect).expr_to_sql(&predicate)?;
+        sql.push_str(&format!(" WHERE {predicate}"));
+    }
+
     if let Some(limit) = limit {
         sql.push_str(&format!(" LIMIT {limit}"));
     }
+
     Ok(sql)
 }
 
-fn source_query(source: &FlightSqlSource) -> String {
+pub(crate) fn classify_filter(
+    source: &FlightSqlSource,
+    table_options: &FlightSqlTableOptions,
+    filter: &Expr,
+) -> Result<TableProviderFilterPushDown> {
+    use TableProviderFilterPushDown::{Inexact, Unsupported};
+
     match source {
-        FlightSqlSource::Table(name) => {
-            format!("SELECT * FROM {}", quote_identifier(name))
+        FlightSqlSource::Query(_) => Ok(Unsupported),
+        FlightSqlSource::Table(_) if !table_options.pushdown_enabled() => Ok(Unsupported),
+        FlightSqlSource::Table(_) => {
+            let unsupported_function = filter.exists(|expr| {
+                Ok(matches!(
+                    expr,
+                    Expr::ScalarFunction(function)
+                        if !FLIGHT_SQL_PUSHABLE_FUNCTIONS.iter()
+                            .any(|name| name.eq_ignore_ascii_case(function.func.name()))
+                ))
+            })?;
+            if unsupported_function
+                || Unparser::new(&FlightSqlDialect)
+                    .expr_to_sql(filter)
+                    .is_err()
+            {
+                Ok(Unsupported)
+            } else {
+                Ok(Inexact)
+            }
         }
-        FlightSqlSource::Query(query) => query.clone(),
     }
 }
 
 fn quote_identifier(name: &str) -> String {
-    format!("\"{}\"", name.replace('"', "\"\""))
+    format!("\"{}\"", escape_identifier(name))
+}
+
+fn escape_identifier(name: &str) -> String {
+    name.replace('"', "\"\"")
 }
 
 #[cfg(test)]
 mod tests {
+    use std::ops::Not;
     use std::sync::Arc;
 
     use datafusion::arrow::datatypes::{DataType, Field, Schema, SchemaRef};
-    use datafusion::common::DataFusionError;
+    use datafusion::common::{Column, DataFusionError};
+    use datafusion::functions::math::expr_fn::{abs, sin};
+    use datafusion::logical_expr::{expr::Cast, Expr, TableProviderFilterPushDown};
     use datafusion::prelude::{col, lit};
 
-    use super::{discovery_sql, scan_sql};
+    use super::{classify_filter, discovery_sql, scan_sql};
     use crate::{FlightSqlSource, FlightSqlTableOptions};
 
     fn schema() -> SchemaRef {
@@ -220,15 +280,15 @@ mod tests {
         for (input, expected) in [
             (
                 "SELECT 1 AS id;",
-                "SELECT * FROM (SELECT 1 AS id) AS \"flight_source\" LIMIT 1",
+                "SELECT * FROM (SELECT 1 AS id) LIMIT 1",
             ),
             (
                 "SELECT COUNT(*) AS n FROM t",
-                "SELECT * FROM (SELECT COUNT(*) AS n FROM t) AS \"flight_source\" LIMIT 1",
+                "SELECT * FROM (SELECT COUNT(*) AS n FROM t) LIMIT 1",
             ),
             (
                 "WITH x AS (SELECT id FROM t LIMIT 5) SELECT id FROM x ORDER BY id LIMIT 2",
-                "SELECT * FROM (WITH x AS (SELECT id FROM t LIMIT 5) SELECT id FROM x ORDER BY id LIMIT 2) AS \"flight_source\" LIMIT 1",
+                "SELECT * FROM (WITH x AS (SELECT id FROM t LIMIT 5) SELECT id FROM x ORDER BY id LIMIT 2) LIMIT 1",
             ),
         ] {
             assert_eq!(
@@ -242,29 +302,12 @@ mod tests {
     fn scan_projection_preserves_order_and_empty_output() {
         let source = FlightSqlSource::table("t").unwrap();
         for (projection, expected) in [
-            (
-                None,
-                "SELECT * FROM (SELECT * FROM \"t\") AS \"flight_source\"",
-            ),
-            (
-                Some(vec![2, 0]),
-                "SELECT \"c\", \"a\" FROM (SELECT * FROM \"t\") AS \"flight_source\"",
-            ),
-            (
-                Some(vec![]),
-                "SELECT 1 FROM (SELECT * FROM \"t\") AS \"flight_source\"",
-            ),
+            (None, "SELECT * FROM \"t\""),
+            (Some(vec![2, 0]), "SELECT \"c\", \"a\" FROM \"t\""),
+            (Some(vec![]), "SELECT 1 FROM \"t\""),
         ] {
             assert_eq!(
-                scan_sql(
-                    &source,
-                    &schema(),
-                    projection.as_deref(),
-                    &[],
-                    None,
-                    &FlightSqlTableOptions::default(),
-                )
-                .unwrap(),
+                scan_sql(&source, &schema(), projection.as_deref(), &[], None,).unwrap(),
                 expected
             );
         }
@@ -286,10 +329,9 @@ mod tests {
                 Some(&[4, 3, 2, 1, 0]),
                 &[],
                 None,
-                &FlightSqlTableOptions::default(),
             )
             .unwrap(),
-            "SELECT \"caf\u{e9}\", \"a\"\"\"\"b\", \"a\"\"b\", \"a.b\", \"order\" FROM (SELECT * FROM \"a.b\") AS \"flight_source\""
+            "SELECT \"caf\u{e9}\", \"a\"\"\"\"b\", \"a\"\"b\", \"a.b\", \"order\" FROM \"a.b\""
         );
     }
 
@@ -303,7 +345,6 @@ mod tests {
                     Some(&projection),
                     &[],
                     None,
-                    &FlightSqlTableOptions::default(),
                 ),
                 Err(DataFusionError::Plan(_))
             ));
@@ -325,10 +366,9 @@ mod tests {
                     None,
                     &[],
                     limit,
-                    &FlightSqlTableOptions::default(),
                 )
                 .unwrap(),
-                format!("SELECT * FROM (SELECT * FROM \"t\") AS \"flight_source\"{suffix}")
+                format!("SELECT * FROM \"t\"{suffix}")
             );
         }
     }
@@ -338,11 +378,11 @@ mod tests {
         for (input, expected) in [
             (
                 "WITH x AS (SELECT a, b, c FROM t LIMIT 5) SELECT * FROM x ORDER BY c LIMIT 2;",
-                "SELECT \"c\", \"a\" FROM (WITH x AS (SELECT a, b, c FROM t LIMIT 5) SELECT * FROM x ORDER BY c LIMIT 2) AS \"flight_source\" LIMIT 3",
+                "SELECT \"c\", \"a\" FROM (WITH x AS (SELECT a, b, c FROM t LIMIT 5) SELECT * FROM x ORDER BY c LIMIT 2) LIMIT 3",
             ),
             (
                 "SELECT * FROM (SELECT a, b, c FROM t LIMIT 5) AS q ORDER BY c LIMIT 2;",
-                "SELECT \"c\", \"a\" FROM (SELECT * FROM (SELECT a, b, c FROM t LIMIT 5) AS q ORDER BY c LIMIT 2) AS \"flight_source\" LIMIT 3",
+                "SELECT \"c\", \"a\" FROM (SELECT * FROM (SELECT a, b, c FROM t LIMIT 5) AS q ORDER BY c LIMIT 2) LIMIT 3",
             ),
         ] {
             assert_eq!(
@@ -352,7 +392,6 @@ mod tests {
                     Some(&[2, 0]),
                     &[],
                     Some(3),
-                    &FlightSqlTableOptions::default(),
                 )
                 .unwrap(),
                 expected
@@ -361,27 +400,92 @@ mod tests {
     }
 
     #[test]
-    fn scan_filters_are_rejected_until_predicate_support_is_implemented() {
-        for source in [
-            FlightSqlSource::table("t").unwrap(),
-            FlightSqlSource::query("SELECT * FROM t").unwrap(),
+    fn predicate_renderable_expressions_are_inexact() {
+        let source = FlightSqlSource::table("t").unwrap();
+        let options = FlightSqlTableOptions::default().with_datafusion_compatible_pushdown();
+        for filter in [
+            col("a").gt(col("c")),
+            col("text").eq(lit("x")),
+            col("float").gt(lit(1.5)),
+            Expr::Cast(Cast::new(Box::new(col("a")), DataType::Float64)).gt(lit(1.5)),
+            abs(col("a")).gt(lit(1_i64)),
+            col("a").is_null().or(col("a").gt(lit(1_i64))).not(),
         ] {
-            for options in [
-                FlightSqlTableOptions::default(),
-                FlightSqlTableOptions::default().with_datafusion_compatible_pushdown(),
-            ] {
-                assert!(matches!(
-                    scan_sql(
-                        &source,
-                        &schema(),
-                        None,
-                        &[col("a").gt(lit(1_i64))],
-                        Some(1),
-                        &options,
-                    ),
-                    Err(DataFusionError::Plan(_))
-                ));
-            }
+            assert_eq!(
+                classify_filter(&source, &options, &filter).unwrap(),
+                TableProviderFilterPushDown::Inexact,
+                "{filter}"
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_function_policy_rejects_whole_trees() {
+        let source = FlightSqlSource::table("t").unwrap();
+        let options = FlightSqlTableOptions::default().with_datafusion_compatible_pushdown();
+        let supported = abs(col("a")).gt(lit(1_i64));
+        let unsupported = sin(col("a")).gt(lit(0.5));
+        for filter in [
+            unsupported.clone(),
+            supported.clone().and(unsupported.clone()),
+            supported.clone().or(unsupported.clone()),
+            supported.clone().or(unsupported).not(),
+        ] {
+            assert_eq!(
+                classify_filter(&source, &options, &filter).unwrap(),
+                TableProviderFilterPushDown::Unsupported,
+                "{filter}"
+            );
+        }
+        for (source, options) in [
+            (source, FlightSqlTableOptions::default()),
+            (FlightSqlSource::query("SELECT * FROM t").unwrap(), options),
+        ] {
+            assert_eq!(
+                classify_filter(&source, &options, &supported).unwrap(),
+                TableProviderFilterPushDown::Unsupported
+            );
+        }
+    }
+
+    #[test]
+    fn predicate_rendering_preserves_precedence() {
+        let filter = col("a").gt(lit(1_i64)).or(col("b").is_null()).not();
+        let sql = scan_sql(
+            &FlightSqlSource::table("t").unwrap(),
+            &schema(),
+            Some(&[0]),
+            &[filter, col("c").lt_eq(lit(40_i64))],
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            sql,
+            "SELECT \"a\" FROM \"t\" WHERE (NOT ((\"a\" > 1) OR \"b\" IS NULL) AND (\"c\" <= 40))"
+        );
+    }
+
+    #[test]
+    fn predicate_rendering_keeps_column_names_literal() {
+        for (name, quoted) in [
+            ("select", "\"select\""),
+            ("a.b", "\"a.b\""),
+            ("a\"b", "\"a\"\"b\""),
+            ("a\"\"b", "\"a\"\"\"\"b\""),
+            ("a\\\"b", "\"a\\\"\"b\""),
+            ("caf\u{e9}", "\"caf\u{e9}\""),
+        ] {
+            let schema = Arc::new(Schema::new(vec![Field::new(name, DataType::Int64, false)]));
+            let filter = Expr::Column(Column::new_unqualified(name)).eq(lit(1_i64));
+            let sql = scan_sql(
+                &FlightSqlSource::table("t").unwrap(),
+                &schema,
+                None,
+                &[filter],
+                None,
+            )
+            .unwrap();
+            assert_eq!(sql, format!("SELECT * FROM \"t\" WHERE ({quoted} = 1)"));
         }
     }
 }
