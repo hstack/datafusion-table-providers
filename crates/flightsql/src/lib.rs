@@ -45,9 +45,12 @@ mod channel;
 pub mod codec;
 mod exec;
 pub mod sql;
+mod sql_gen;
+mod sql_provider;
 
 pub use channel::{DefaultFlightChannelProvider, FlightChannelProvider};
 pub use exec::enforce_schema;
+pub use sql_provider::{FlightSqlSource, FlightSqlTableOptions};
 
 /// Generic Arrow Flight data source. Requires a [FlightDriver] that allows implementors
 /// to integrate any custom Flight RPC service by producing a [FlightMetadata] for some DDL.
