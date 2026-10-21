@@ -36,6 +36,7 @@ chrono = "0.4.44"
 clickhouse = "0.15"
 datafusion = { workspace = true, default-features = false, features = ["sql"] }
 datafusion-federation = { workspace = true, features = ["sql"] }
+datafusion-proto = { workspace = true }
 duckdb = { workspace = true, features = [
   "bundled",
   "r2d2",
@@ -66,7 +67,7 @@ serde_json = "1.0"
 sha2 = "0.11"
 tempfile = "3.27.0"
 test-log = { version = "0.2", features = ["trace"] }
-tokio = { version = "1.52", features = ["macros", "fs", "rt-multi-thread"] }
+tokio = { version = "1.52", features = ["macros", "fs", "rt-multi-thread", "test-util"] }
 tokio-rusqlite = "0.7"
 tokio-stream = { version = "0.1", features = ["net"] }
 tonic = { version = "0.14", features = ["tls-native-roots", "tls-webpki-roots"] }
